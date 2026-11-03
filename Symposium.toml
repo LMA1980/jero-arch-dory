@@ -1,0 +1,10 @@
+name = "k3-arch-dory"
+# Crate-embedded Symposium manifest for k3-arch-dory.
+
+[[plugins]]
+depends-on = ["k3-core"]
+source.cargo = "k3-core"
+
+[[plugins]]
+depends-on = ["kernels-rvv"]
+source.cargo = "kernels-rvv"
