@@ -1,4 +1,4 @@
-//! `k3-arch-dory`: NVIDIA Nemotron-Labs Dory1.0 looped latent-recurrent nGPT architecture recipe
+//! `jero-arch-dory`: NVIDIA Nemotron-Labs Dory1.0 looped latent-recurrent nGPT architecture recipe
 //! for the `SpacemiT` K3 platform.
 
 pub mod recipe;
@@ -13,7 +13,7 @@ pub use recipe::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+    use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 
     struct TestWeights<'a> {
         tensors: Vec<(&'static str, TensorView<'a>)>,

@@ -1,9 +1,9 @@
 //! NVIDIA Nemotron-Labs Dory1.0 looped latent-recurrent nGPT recipe (`dory`).
 
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
-use kernels_rvv::{
+use jero_kernels_rvv::{
     BaselineKernel, VectorKernel, bf16_to_f32_finite, dequantize_q5_k_block, dequantize_q6_k_block,
     dequantize_q8_0_block, l2_norm_f32_in_place, ngpt_residual_lerp_in_place, vec_dot_q5_k,
 };
