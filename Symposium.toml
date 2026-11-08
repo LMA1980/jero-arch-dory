@@ -1,10 +1,10 @@
-name = "k3-arch-dory"
-# Crate-embedded Symposium manifest for k3-arch-dory.
+name = "jero-arch-dory"
+# Crate-embedded Symposium manifest for jero-arch-dory.
 
 [[plugins]]
-depends-on = ["k3-core"]
-source.cargo = "k3-core"
+depends-on = ["jero-core"]
+source.cargo = "jero-core"
 
 [[plugins]]
-depends-on = ["kernels-rvv"]
-source.cargo = "kernels-rvv"
+depends-on = ["jero-kernels-rvv"]
+source.cargo = "jero-kernels-rvv"
