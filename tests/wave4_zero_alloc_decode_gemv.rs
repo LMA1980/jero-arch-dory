@@ -10,8 +10,9 @@
 //!   parity under `< 1e-4`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use jero_arch_dory::{DoryKvCacheMode, DoryRecipe, DorySubLayerKind};
 use jero_core::{
@@ -20,19 +21,25 @@ use jero_core::{
 
 struct CountingAllocator;
 
-static TRACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 static TEST_SERIAL_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static THREAD_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
 #[global_allocator]
 static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 
-// SAFETY: Delegates directly to `std::alloc::System` while atomically counting allocations on all
-// threads (including Rayon worker threads) when `TRACK_ACTIVE` is enabled.
+// SAFETY: Delegates directly to `std::alloc::System` while atomically counting allocations on the
+// calling test thread and active pool workers tagged with the current `ACTIVE_EPOCH`.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if TRACK_ACTIVE.load(Ordering::Relaxed) {
+        let active = ACTIVE_EPOCH.load(Ordering::Relaxed);
+        if active != 0 && THREAD_EPOCH.try_with(Cell::get).unwrap_or(0) == active {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
@@ -46,7 +53,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if TRACK_ACTIVE.load(Ordering::Relaxed) {
+        let active = ACTIVE_EPOCH.load(Ordering::Relaxed);
+        if active != 0 && THREAD_EPOCH.try_with(Cell::get).unwrap_or(0) == active {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
         }
@@ -55,18 +63,59 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-fn measure_allocs<F, R>(op: F) -> (R, usize, usize)
+fn measure_allocs_in_pool<F, R>(pool: Option<&rayon::ThreadPool>, op: F) -> (R, usize, usize)
 where
-    F: FnOnce() -> R,
+    F: FnOnce() -> R + Send,
+    R: Send,
 {
+    let epoch = NEXT_EPOCH.fetch_add(1, Ordering::SeqCst);
+    THREAD_EPOCH.with(|cell| cell.set(epoch));
+    if let Some(p) = pool {
+        let n = p.current_num_threads();
+        let barrier = Barrier::new(n);
+        p.broadcast(|_| {
+            THREAD_EPOCH.with(|cell| cell.set(epoch));
+            barrier.wait();
+        });
+    }
     ALLOC_COUNT.store(0, Ordering::SeqCst);
     ALLOC_BYTES.store(0, Ordering::SeqCst);
-    TRACK_ACTIVE.store(true, Ordering::SeqCst);
-    let out = op();
-    TRACK_ACTIVE.store(false, Ordering::SeqCst);
+    ACTIVE_EPOCH.store(epoch, Ordering::SeqCst);
+    let out = match pool {
+        Some(p) => p.install(op),
+        None => op(),
+    };
+    ACTIVE_EPOCH.store(0, Ordering::SeqCst);
     let count = ALLOC_COUNT.load(Ordering::SeqCst);
     let bytes = ALLOC_BYTES.load(Ordering::SeqCst);
     (out, count, bytes)
+}
+
+fn measure_allocs<F, R>(op: F) -> (R, usize, usize)
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    measure_allocs_in_pool(None, op)
+}
+
+fn warm_pool(pool: &rayon::ThreadPool) {
+    use rayon::prelude::*;
+
+    let n = pool.current_num_threads();
+    let barrier_start = Barrier::new(n);
+    pool.broadcast(|_| {
+        // Materialize each worker's OS thread parker/TLS handle before entering measured windows.
+        std::thread::park_timeout(std::time::Duration::ZERO);
+        barrier_start.wait();
+    });
+    let warm: usize = pool.install(|| (0..n * 64).into_par_iter().map(|i| i + 1).sum());
+    let total = n * 64;
+    assert_eq!(warm, total * (total + 1) / 2);
+    let barrier_done = Barrier::new(n);
+    pool.broadcast(|_| {
+        barrier_done.wait();
+    });
 }
 
 struct TensorEntry {
@@ -543,10 +592,27 @@ fn test_wave4_worker_partitions_1_4_8_bit_exact_and_zero_alloc() {
         .num_threads(8)
         .build()
         .unwrap();
-    // Warm up thread pools before entering any CountingAllocator window.
-    let warm_4: usize = pool_4.install(|| (0..128_usize).into_par_iter().map(|i| i + 1).sum());
-    let warm_8: usize = pool_8.install(|| (0..128_usize).into_par_iter().map(|i| i + 1).sum());
-    assert_eq!(warm_4, warm_8);
+    // Barrier-synchronize all pool workers through startup/parker initialization before measuring.
+    warm_pool(&pool_4);
+    warm_pool(&pool_8);
+
+    // Self-check that epoch-scoped tracking still captures genuine allocations on both the calling
+    // thread and active pool workers.
+    let (_, call_allocs, call_bytes) = measure_allocs(|| vec![1_u8; 64].len());
+    assert!(
+        call_allocs >= 1 && call_bytes >= 64,
+        "calling-thread heap allocation must be captured ({call_allocs}, {call_bytes})"
+    );
+    let (_, pool_allocs, pool_bytes) = measure_allocs_in_pool(Some(&pool_4), || {
+        (0..4_usize)
+            .into_par_iter()
+            .map(|_| vec![1_u8; 64].len())
+            .sum::<usize>()
+    });
+    assert!(
+        pool_allocs >= 4 && pool_bytes >= 256,
+        "active pool worker heap allocations must be captured ({pool_allocs}, {pool_bytes})"
+    );
 
     let configs: &[(QuantType, u32, usize)] = &[
         (QuantType::Q5_K, 256, 64),
@@ -596,10 +662,8 @@ fn test_wave4_worker_partitions_1_4_8_bit_exact_and_zero_alloc() {
 
             for tok in [1_u32, 17, 42] {
                 ctx.prepare_decode(tok).unwrap();
-                let (res, allocs, bytes) = measure_allocs(|| match pool {
-                    Some(p) => p.install(|| recipe.decode_step(&mut ctx, &weights)),
-                    None => recipe.decode_step(&mut ctx, &weights),
-                });
+                let (res, allocs, bytes) =
+                    measure_allocs_in_pool(pool, || recipe.decode_step(&mut ctx, &weights));
                 res.unwrap();
                 assert_eq!(
                     (allocs, bytes),
