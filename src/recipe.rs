@@ -9,10 +9,13 @@ use jero_core::{
 };
 
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{l2_norm_f32_in_place, ngpt_residual_lerp_in_place};
+use jero_kernels_rvv::{
+    AttentionMaskConfig, gqa_causal_attention_prefill_f32, l2_norm_f32_in_place,
+    ngpt_residual_lerp_in_place,
+};
 
 use crate::physical_cache::{
-    AlignedF32Vec, DoryPhysicalCache, DoryPhysicalSubLayer, DoryStopMetadata,
+    AlignedF32Vec, DoryBatchAct, DoryPhysicalCache, DoryPhysicalSubLayer, DoryStopMetadata,
     validate_1d_scale_view,
 };
 use crate::quant;
@@ -1133,6 +1136,7 @@ impl DoryRecipe {
         let cache_ref = resolved.as_ref().map(ResolvedCache::as_ref);
 
         let num_kv_slots = self.attention_kv_layer_count()?;
+        let compute_logits = ctx.compute_logits();
         let (logits_buf, kv_buf) = ctx.buffers_mut();
         let mut kv_view = if num_kv_slots > 0 {
             let geom = self.kv_geometry(n_ctx)?;
@@ -1145,24 +1149,23 @@ impl DoryRecipe {
             None
         };
 
-        let mut last_hidden = Vec::new();
-        for (idx, &token_id) in tokens.iter().enumerate() {
-            last_hidden = self.execute_dory_schedule_with_cache(
-                token_id,
-                start_pos + idx,
-                kv_view.as_mut(),
-                cache_ref,
+        let last_hidden = self.execute_dory_batched_prefill_with_cache(
+            &tokens,
+            start_pos,
+            kv_view.as_mut(),
+            cache_ref,
+            weights,
+        )?;
+
+        if compute_logits {
+            populate_dory_logits(
+                self,
+                &last_hidden,
+                logits_buf,
                 weights,
+                cache_ref.and_then(DoryPhysicalCache::output_scale),
             )?;
         }
-
-        populate_dory_logits(
-            self,
-            &last_hidden,
-            logits_buf,
-            weights,
-            cache_ref.and_then(DoryPhysicalCache::output_scale),
-        )?;
         ctx.advance_position(tokens.len())?;
         Ok(())
     }
@@ -1298,6 +1301,101 @@ impl DoryRecipe {
         Ok(cur)
     }
 
+    fn execute_dory_batched_prefill_with_cache(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        mut kv_view: Option<&mut KvCacheView<'_>>,
+        cache: Option<&DoryPhysicalCache>,
+        weights: &dyn ModelWeights,
+    ) -> Result<Vec<f32>, K3Error> {
+        let m = tokens.len();
+        let hidden_dim = (self.hidden_dim as usize).max(2);
+        let mut cur = vec![0.0_f32; m * hidden_dim];
+
+        match weights.tensor("token_embd.weight") {
+            Ok(embd) => {
+                for (row_idx, &token_id) in tokens.iter().enumerate() {
+                    let row_dst = &mut cur[row_idx * hidden_dim..(row_idx + 1) * hidden_dim];
+                    quant::dequantize_row_to_f32(&embd, token_id as usize, hidden_dim, row_dst)?;
+                    l2_normalize_in_place(row_dst, DORY_L2_EPS);
+                }
+            }
+            Err(err) => {
+                if weights.tensor_count() == 0 {
+                    for (row_idx, &token_id) in tokens.iter().enumerate() {
+                        let row_dst = &mut cur[row_idx * hidden_dim..(row_idx + 1) * hidden_dim];
+                        row_dst.copy_from_slice(&synthetic_unit_embedding(token_id, hidden_dim));
+                        l2_normalize_in_place(row_dst, DORY_L2_EPS);
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+
+        let Some(physical_cache) = cache else {
+            return Ok(cur[(m - 1) * hidden_dim..].to_vec());
+        };
+
+        let mut scratch = DoryPrefillScratch::new(m, hidden_dim);
+        let mut virtual_idx = 0_u32;
+
+        // 1. Input Block (0 .. n_input_layers) across all M tokens
+        self.execute_physical_range_batched_cached(
+            &mut cur,
+            m,
+            0..self.n_input_layers,
+            &mut virtual_idx,
+            start_pos,
+            kv_view.as_deref_mut(),
+            physical_cache,
+            &mut scratch,
+        )?;
+
+        // 2. Latch [M, hidden_dim] anchor at il == n_input_layers
+        let input_h = cur.clone();
+
+        // 3. Shared Recurrent Block (n_loops iterations of n_input_layers .. rec_end)
+        let rec_end = self.n_input_layers + self.n_recurrent_layers;
+        for _loop_idx in 0..self.n_loops {
+            // Loop-entry batched re-injection: cur[t] = L2Norm(cur[t] + input_h[t])
+            for (c, &inp) in cur.iter_mut().zip(input_h.iter()) {
+                *c += inp;
+            }
+            l2_normalize_rows_in_place(&mut cur, hidden_dim, DORY_L2_EPS);
+
+            self.execute_physical_range_batched_cached(
+                &mut cur,
+                m,
+                self.n_input_layers..rec_end,
+                &mut virtual_idx,
+                start_pos,
+                kv_view.as_deref_mut(),
+                physical_cache,
+                &mut scratch,
+            )?;
+
+            // Loop-exit batched normalization: cur[t] = L2Norm(cur[t])
+            l2_normalize_rows_in_place(&mut cur, hidden_dim, DORY_L2_EPS);
+        }
+
+        // 4. Output Block (rec_end .. n_physical) across all M tokens
+        let n_physical = self.physical_layer_count();
+        self.execute_physical_range_batched_cached(
+            &mut cur,
+            m,
+            rec_end..n_physical,
+            &mut virtual_idx,
+            start_pos,
+            kv_view,
+            physical_cache,
+            &mut scratch,
+        )?;
+
+        Ok(cur[(m - 1) * hidden_dim..].to_vec())
+    }
+
     fn execute_physical_range_cached(
         &self,
         cur: &mut [f32],
@@ -1321,6 +1419,54 @@ impl DoryRecipe {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "segment execution passes batched hidden tensor, sequence offset, cache, and shared scratch"
+    )]
+    fn execute_physical_range_batched_cached(
+        &self,
+        cur: &mut [f32],
+        m: usize,
+        phys_range: std::ops::Range<u32>,
+        virtual_idx: &mut u32,
+        start_pos: usize,
+        mut kv_view: Option<&mut KvCacheView<'_>>,
+        cache: &DoryPhysicalCache,
+        scratch: &mut DoryPrefillScratch,
+    ) -> Result<(), K3Error> {
+        for p in phys_range {
+            let sublayer = cache.get(p)?;
+            match sublayer {
+                DoryPhysicalSubLayer::Attention { attn_alpha, .. } => {
+                    let (kv_slot, kv) =
+                        resolve_kv_slot_and_view(self, p, *virtual_idx, kv_view.as_deref_mut())?;
+                    run_dory_attention_batched_cached(
+                        self, cur, m, start_pos, kv_slot, kv, sublayer, scratch,
+                    )?;
+                    apply_ngpt_residual_update_batch(
+                        cur,
+                        &scratch.sub_out,
+                        attn_alpha.as_slice(),
+                        &mut scratch.residual_row,
+                        m,
+                    )?;
+                }
+                DoryPhysicalSubLayer::Mlp { mlp_alpha, .. } => {
+                    run_dory_mlp_batched_cached(self, cur, m, sublayer, scratch)?;
+                    apply_ngpt_residual_update_batch(
+                        cur,
+                        &scratch.sub_out,
+                        mlp_alpha.as_slice(),
+                        &mut scratch.residual_row,
+                        m,
+                    )?;
+                }
+            }
+            *virtual_idx += 1;
+        }
+        Ok(())
+    }
+
     fn execute_physical_sublayer_cached(
         &self,
         cur: &mut [f32],
@@ -1333,23 +1479,8 @@ impl DoryRecipe {
         let sublayer = cache.get(physical_idx)?;
         match sublayer {
             DoryPhysicalSubLayer::Attention { attn_alpha, .. } => {
-                let kv_slot = self.virtual_to_attention_kv_slot(virtual_idx)?.ok_or_else(|| {
-                    K3Error::CapabilityMismatch {
-                        architecture: "dory".to_owned(),
-                        reason: format!(
-                            "attention sub-layer virtual={virtual_idx} physical={physical_idx} has no KV slot"
-                        ),
-                    }
-                })?;
-                let kv = kv_view.ok_or_else(|| K3Error::TensorBoundsError {
-                    tensor_name: "kv_cache".to_owned(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!(
-                        "missing KvCacheView for attention sub-layer virtual={virtual_idx} slot={kv_slot}"
-                    ),
-                })?;
+                let (kv_slot, kv) =
+                    resolve_kv_slot_and_view(self, physical_idx, virtual_idx, kv_view)?;
                 let sub_out =
                     run_dory_attention_cached_with_kv_view(self, cur, pos, kv_slot, kv, sublayer)?;
                 apply_ngpt_residual_update(cur, &sub_out, attn_alpha.as_slice())?;
@@ -1360,6 +1491,113 @@ impl DoryRecipe {
             }
         }
         Ok(())
+    }
+}
+
+fn resolve_kv_slot_and_view<'a, 'b>(
+    recipe: &DoryRecipe,
+    physical_idx: u32,
+    virtual_idx: u32,
+    kv_view: Option<&'a mut KvCacheView<'b>>,
+) -> Result<(usize, &'a mut KvCacheView<'b>), K3Error> {
+    let kv_slot = recipe
+        .virtual_to_attention_kv_slot(virtual_idx)?
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!(
+                "attention sub-layer virtual={virtual_idx} physical={physical_idx} has no KV slot"
+            ),
+        })?;
+    let kv = kv_view.ok_or_else(|| K3Error::TensorBoundsError {
+        tensor_name: "kv_cache".to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: 0,
+        reason: format!(
+            "missing KvCacheView for attention sub-layer virtual={virtual_idx} slot={kv_slot}"
+        ),
+    })?;
+    Ok((kv_slot, kv))
+}
+
+struct DoryPrefillScratch {
+    act_batch: DoryBatchAct,
+    residual_row: Vec<f32>,
+    sub_out: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    gate: Vec<f32>,
+    attn_heads_out: Vec<f32>,
+    scores_scratch: Vec<f32>,
+    mlp_gate: Vec<f32>,
+    mlp_up: Vec<f32>,
+    hidden_ffn: Vec<f32>,
+}
+
+impl DoryPrefillScratch {
+    fn new(m: usize, hidden_dim: usize) -> Self {
+        Self {
+            act_batch: DoryBatchAct::new(),
+            residual_row: vec![0.0_f32; hidden_dim],
+            sub_out: vec![0.0_f32; m * hidden_dim],
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            gate: Vec::new(),
+            attn_heads_out: Vec::new(),
+            scores_scratch: Vec::new(),
+            mlp_gate: Vec::new(),
+            mlp_up: Vec::new(),
+            hidden_ffn: Vec::new(),
+        }
+    }
+
+    fn ensure_attention(&mut self, m: usize, q_dim: usize, kv_dim: usize, end_pos: usize) {
+        let mq = m * q_dim;
+        let mkv = m * kv_dim;
+        if self.q.len() != mq {
+            self.q.resize(mq, 0.0);
+        }
+        if self.gate.len() != mq {
+            self.gate.resize(mq, 0.0);
+        }
+        if self.attn_heads_out.len() == mq {
+            self.attn_heads_out.fill(0.0);
+        } else {
+            self.attn_heads_out.resize(mq, 0.0);
+        }
+        if self.k.len() != mkv {
+            self.k.resize(mkv, 0.0);
+        }
+        if self.v.len() != mkv {
+            self.v.resize(mkv, 0.0);
+        }
+        if self.scores_scratch.len() < end_pos {
+            self.scores_scratch.resize(end_pos, 0.0);
+        }
+    }
+
+    fn ensure_mlp(&mut self, m: usize, ffn_dim: usize) {
+        let mf = m * ffn_dim;
+        if self.mlp_gate.len() != mf {
+            self.mlp_gate.resize(mf, 0.0);
+        }
+        if self.mlp_up.len() != mf {
+            self.mlp_up.resize(mf, 0.0);
+        }
+        if self.hidden_ffn.len() != mf {
+            self.hidden_ffn.resize(mf, 0.0);
+        }
+    }
+}
+
+fn l2_normalize_rows_in_place(matrix: &mut [f32], row_width: usize, eps: f32) {
+    if row_width == 0 {
+        return;
+    }
+    for row in matrix.chunks_exact_mut(row_width) {
+        l2_normalize_in_place(row, eps);
     }
 }
 
@@ -1403,7 +1641,18 @@ pub fn apply_ngpt_residual_update(
     sub_out: &[f32],
     alpha: &[f32],
 ) -> Result<(), K3Error> {
-    if cur.len() != sub_out.len() || cur.len() != alpha.len() {
+    let mut residual_scratch = vec![0.0_f32; cur.len()];
+    apply_ngpt_residual_update_with_scratch(cur, sub_out, alpha, &mut residual_scratch)
+}
+
+fn apply_ngpt_residual_update_with_scratch(
+    cur: &mut [f32],
+    sub_out: &[f32],
+    alpha: &[f32],
+    residual_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    if cur.len() != sub_out.len() || cur.len() != alpha.len() || cur.len() != residual_scratch.len()
+    {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "ngpt_residual".to_owned(),
             offset: 0,
@@ -1414,18 +1663,51 @@ pub fn apply_ngpt_residual_update(
     }
     #[cfg(feature = "with-kernels")]
     {
-        let residual = cur.to_vec();
+        residual_scratch.copy_from_slice(cur);
         cur.copy_from_slice(sub_out);
-        ngpt_residual_lerp_in_place(&residual, cur, alpha, 1.0, DORY_L2_EPS)
+        ngpt_residual_lerp_in_place(residual_scratch, cur, alpha, 1.0, DORY_L2_EPS)
     }
     #[cfg(not(feature = "with-kernels"))]
     {
+        let _ = residual_scratch;
         for ((a, &b), &al) in cur.iter_mut().zip(sub_out.iter()).zip(alpha.iter()) {
             *a += al.abs() * (b - *a);
         }
         l2_normalize_in_place(cur, DORY_L2_EPS);
         Ok(())
     }
+}
+
+fn apply_ngpt_residual_update_batch(
+    cur: &mut [f32],
+    sub_out: &[f32],
+    alpha: &[f32],
+    residual_scratch: &mut [f32],
+    m: usize,
+) -> Result<(), K3Error> {
+    let width = alpha.len();
+    let expected = m.saturating_mul(width);
+    if width == 0
+        || cur.len() != expected
+        || sub_out.len() != expected
+        || residual_scratch.len() != width
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "ngpt_residual_batch".to_owned(),
+            offset: 0,
+            byte_len: cur.len(),
+            buffer_len: sub_out.len(),
+            reason: format!(
+                "batched nGPT residual dimension mismatch (m={m}, width={width}, cur={}, sub_out={})",
+                cur.len(),
+                sub_out.len()
+            ),
+        });
+    }
+    for (cur_row, sub_row) in cur.chunks_exact_mut(width).zip(sub_out.chunks_exact(width)) {
+        apply_ngpt_residual_update_with_scratch(cur_row, sub_row, alpha, residual_scratch)?;
+    }
+    Ok(())
 }
 
 /// Executes a disaggregated Dory nGPT attention sub-layer (`'S'` sliding-window or `'*'`/`'g'` full-context):
@@ -1491,9 +1773,8 @@ pub fn run_dory_attention_sublayer(
 }
 
 #[expect(
-    clippy::too_many_lines,
     clippy::cast_precision_loss,
-    reason = "complete nGPT attention sub-layer operator backed by RepackedWeight and bounds-checked KvCacheView"
+    reason = "head dimensions fit cleanly in f32"
 )]
 fn run_dory_attention_cached_with_kv_view(
     recipe: &DoryRecipe,
@@ -1532,19 +1813,7 @@ fn run_dory_attention_cached_with_kv_view(
     let q_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
 
-    if sqk.len() != q_dim || attn_gate.len() != q_dim {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: format!("blk.{physical_idx}.attn_qk_scale.weight"),
-            offset: 0,
-            byte_len: sqk.len(),
-            buffer_len: q_dim,
-            reason: format!(
-                "cached attention scale lengths (sqk={}, attn_gate={}) != q_dim {q_dim}",
-                sqk.len(),
-                attn_gate.len()
-            ),
-        });
-    }
+    validate_attention_scales(*physical_idx, sqk.len(), attn_gate.len(), q_dim)?;
 
     let mut q = vec![0.0_f32; q_dim];
     let mut k = vec![0.0_f32; kv_dim];
@@ -1568,24 +1837,18 @@ fn run_dory_attention_cached_with_kv_view(
     let qk_scale = sqk.as_slice();
     let init_std = recipe.init_std.max(1e-6);
     let sqrt_head_dim = (head_dim as f32).sqrt();
-    for h in 0..num_heads {
-        let slice = &mut q[h * head_dim..(h + 1) * head_dim];
-        l2_normalize_in_place(slice, DORY_L2_EPS);
-        for (i, val) in slice.iter_mut().enumerate() {
-            let s = qk_scale[h * head_dim + i] * sqrt_head_dim / init_std;
-            *val *= s * s;
-        }
-    }
     let kv_group_size = (num_heads / num_kv_heads).max(1);
-    for kh in 0..num_kv_heads {
-        let slice = &mut k[kh * head_dim..(kh + 1) * head_dim];
-        l2_normalize_in_place(slice, DORY_L2_EPS);
-        let q_head_ref = kh * kv_group_size;
-        for (i, val) in slice.iter_mut().enumerate() {
-            let s = qk_scale[q_head_ref * head_dim + i] * sqrt_head_dim / init_std;
-            *val *= s * s;
-        }
-    }
+    apply_qk_head_norm_and_sqk(
+        &mut q,
+        &mut k,
+        qk_scale,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_group_size,
+        sqrt_head_dim,
+        init_std,
+    );
 
     // Write K and V into compact attention-only KvCacheView (fails closed on overflow/OOB)
     {
@@ -1595,36 +1858,394 @@ fn run_dory_attention_cached_with_kv_view(
     }
 
     let (k_plane, v_plane) = kv_view.layer_kv(kv_slot)?;
-    let valid_len = pos + 1;
-    let window_start = if *kind == DorySubLayerKind::SlidingAttention {
-        let swa = (recipe.sliding_window as usize).max(1);
-        valid_len.saturating_sub(swa)
-    } else {
-        0
+    let sliding_window = (*kind == DorySubLayerKind::SlidingAttention)
+        .then(|| (recipe.sliding_window as usize).max(1));
+    let attn_scale = sqrt_head_dim;
+    let mut attn_heads_out = vec![0.0_f32; q_dim];
+    let mut scores_scratch = vec![0.0_f32; pos + 1];
+    accumulate_causal_gqa_row(
+        &mut attn_heads_out,
+        &q,
+        k_plane,
+        v_plane,
+        pos,
+        num_heads,
+        kv_group_size,
+        head_dim,
+        kv_dim,
+        sliding_window,
+        attn_scale,
+        &mut scores_scratch,
+    );
+
+    apply_attention_sigmoid_gate_and_norm(
+        &mut attn_heads_out,
+        &gate,
+        attn_gate.as_slice(),
+        1,
+        q_dim,
+        recipe.gate_init,
+        init_std,
+    );
+
+    let mut sub_out = vec![0.0_f32; hidden_dim];
+    wo.project_f32(&mut sub_out, &attn_heads_out)?;
+    l2_normalize_in_place(&mut sub_out, DORY_L2_EPS);
+    Ok(sub_out)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "complete batched nGPT attention sub-layer over RepackedWeight, QuantizedActQ8, and gqa_causal_attention_prefill_f32"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "head dimensions fit cleanly in f32"
+)]
+fn run_dory_attention_batched_cached(
+    recipe: &DoryRecipe,
+    cur: &[f32],
+    m: usize,
+    start_pos: usize,
+    kv_slot: usize,
+    kv_view: &mut KvCacheView<'_>,
+    sublayer: &DoryPhysicalSubLayer,
+    scratch: &mut DoryPrefillScratch,
+) -> Result<(), K3Error> {
+    let DoryPhysicalSubLayer::Attention {
+        physical_idx,
+        kind,
+        wq,
+        wk,
+        wv,
+        wgate,
+        wo,
+        sqk,
+        attn_gate,
+        ..
+    } = sublayer
+    else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!(
+                "expected Attention physical sublayer at {}, found Mlp",
+                sublayer.physical_idx()
+            ),
+        });
     };
 
-    let attn_scale = (head_dim as f32).sqrt();
-    let mut attn_heads_out = vec![0.0_f32; q_dim];
+    let hidden_dim = (recipe.hidden_dim as usize).max(2);
+    let num_heads = (recipe.num_heads as usize).max(1);
+    let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let end_pos = start_pos + m;
+
+    validate_batched_input_len(cur, m, hidden_dim, *physical_idx, "attn_input")?;
+    validate_attention_scales(*physical_idx, sqk.len(), attn_gate.len(), q_dim)?;
+
+    scratch.ensure_attention(m, q_dim, kv_dim, end_pos);
+
+    // Quantize [M, hidden_dim] activations once and reuse across Q, K, V, and attn_gate projections.
+    scratch.act_batch.prepare_into(cur, m, hidden_dim)?;
+    wq.project_batch_prepared(&mut scratch.q, &scratch.act_batch)?;
+    wk.project_batch_prepared(&mut scratch.k, &scratch.act_batch)?;
+    wv.project_batch_prepared(&mut scratch.v, &scratch.act_batch)?;
+    wgate.project_batch_prepared(&mut scratch.gate, &scratch.act_batch)?;
+
+    let theta = if *kind == DorySubLayerKind::FullAttention {
+        recipe.rope_theta_full
+    } else {
+        recipe.rope_theta_swa
+    };
+    let init_std = recipe.init_std.max(1e-6);
+    let sqrt_head_dim = (head_dim as f32).sqrt();
+    apply_batched_rope_and_qk_sqk(
+        &mut scratch.q,
+        &mut scratch.k,
+        sqk.as_slice(),
+        m,
+        start_pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        theta,
+        sqrt_head_dim,
+        init_std,
+    );
+
+    write_batched_kv_slice(
+        kv_view, kv_slot, start_pos, m, kv_dim, &scratch.k, &scratch.v,
+    )?;
+
+    execute_batched_gqa_causal_attention(
+        recipe,
+        *kind,
+        kv_view,
+        kv_slot,
+        start_pos,
+        m,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sqrt_head_dim,
+        scratch,
+    )?;
+
+    apply_attention_sigmoid_gate_and_norm(
+        &mut scratch.attn_heads_out,
+        &scratch.gate,
+        attn_gate.as_slice(),
+        m,
+        q_dim,
+        recipe.gate_init,
+        init_std,
+    );
+
+    scratch
+        .act_batch
+        .prepare_into(&scratch.attn_heads_out, m, q_dim)?;
+    wo.project_batch_prepared(&mut scratch.sub_out, &scratch.act_batch)?;
+    l2_normalize_rows_in_place(&mut scratch.sub_out, hidden_dim, DORY_L2_EPS);
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batched per-row NeoX RoPE, L2-normalization, and sqk scaling over [M, *]"
+)]
+fn apply_batched_rope_and_qk_sqk(
+    q: &mut [f32],
+    k: &mut [f32],
+    qk_scale: &[f32],
+    m: usize,
+    start_pos: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    sqrt_head_dim: f32,
+    init_std: f32,
+) {
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let kv_group_size = (num_heads / num_kv_heads).max(1);
+    for row_m in 0..m {
+        let pos = start_pos + row_m;
+        let q_row = &mut q[row_m * q_dim..(row_m + 1) * q_dim];
+        let k_row = &mut k[row_m * kv_dim..(row_m + 1) * kv_dim];
+        apply_neox_rope(q_row, num_heads, head_dim, pos, theta);
+        apply_neox_rope(k_row, num_kv_heads, head_dim, pos, theta);
+        apply_qk_head_norm_and_sqk(
+            q_row,
+            k_row,
+            qk_scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_group_size,
+            sqrt_head_dim,
+            init_std,
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dispatches batched causal GQA attention across kernel and portable paths"
+)]
+fn execute_batched_gqa_causal_attention(
+    recipe: &DoryRecipe,
+    kind: DorySubLayerKind,
+    kv_view: &KvCacheView<'_>,
+    kv_slot: usize,
+    start_pos: usize,
+    m: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    attn_scale: f32,
+    scratch: &mut DoryPrefillScratch,
+) -> Result<(), K3Error> {
+    let kv_dim = num_kv_heads * head_dim;
+    let (k_plane, v_plane) = kv_view.layer_kv(kv_slot)?;
+    let sliding_window = (kind == DorySubLayerKind::SlidingAttention)
+        .then(|| (recipe.sliding_window as usize).max(1));
+    #[cfg(feature = "with-kernels")]
+    {
+        let end_pos = start_pos + m;
+        let prefix_len = end_pos * kv_dim;
+        let mask_cfg =
+            AttentionMaskConfig::causal(start_pos, attn_scale).with_sliding_window(sliding_window);
+        gqa_causal_attention_prefill_f32(
+            &mut scratch.attn_heads_out,
+            &scratch.q,
+            &k_plane[..prefix_len],
+            &v_plane[..prefix_len],
+            m,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            end_pos,
+            mask_cfg,
+            &mut scratch.scores_scratch,
+        )?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let q_dim = num_heads * head_dim;
+        let kv_group_size = (num_heads / num_kv_heads).max(1);
+        for row_m in 0..m {
+            let q_row = &scratch.q[row_m * q_dim..(row_m + 1) * q_dim];
+            let out_row = &mut scratch.attn_heads_out[row_m * q_dim..(row_m + 1) * q_dim];
+            accumulate_causal_gqa_row(
+                out_row,
+                q_row,
+                k_plane,
+                v_plane,
+                start_pos + row_m,
+                num_heads,
+                kv_group_size,
+                head_dim,
+                kv_dim,
+                sliding_window,
+                attn_scale,
+                &mut scratch.scores_scratch,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-token nGPT head L2-normalization and sqk scaling across Q and K"
+)]
+fn apply_qk_head_norm_and_sqk(
+    q_row: &mut [f32],
+    k_row: &mut [f32],
+    qk_scale: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_group_size: usize,
+    sqrt_head_dim: f32,
+    init_std: f32,
+) {
+    for h in 0..num_heads {
+        let slice = &mut q_row[h * head_dim..(h + 1) * head_dim];
+        l2_normalize_in_place(slice, DORY_L2_EPS);
+        for (i, val) in slice.iter_mut().enumerate() {
+            let s = qk_scale[h * head_dim + i] * sqrt_head_dim / init_std;
+            *val *= s * s;
+        }
+    }
+    for kh in 0..num_kv_heads {
+        let slice = &mut k_row[kh * head_dim..(kh + 1) * head_dim];
+        l2_normalize_in_place(slice, DORY_L2_EPS);
+        let q_head_ref = kh * kv_group_size;
+        for (i, val) in slice.iter_mut().enumerate() {
+            let s = qk_scale[q_head_ref * head_dim + i] * sqrt_head_dim / init_std;
+            *val *= s * s;
+        }
+    }
+}
+
+fn write_batched_kv_slice(
+    kv_view: &mut KvCacheView<'_>,
+    kv_slot: usize,
+    start_pos: usize,
+    m: usize,
+    kv_dim: usize,
+    k_batch: &[f32],
+    v_batch: &[f32],
+) -> Result<(), K3Error> {
+    let total_elems = m
+        .checked_mul(kv_dim)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: start_pos,
+            byte_len: usize::MAX,
+            buffer_len: 0,
+            reason: "batched KV element count overflow".to_owned(),
+        })?;
+    let (k_plane_mut, v_plane_mut) = kv_view.layer_kv_mut(kv_slot)?;
+    let write_start = start_pos
+        .checked_mul(kv_dim)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: usize::MAX,
+            byte_len: total_elems.saturating_mul(size_of::<f32>()),
+            buffer_len: k_plane_mut.len(),
+            reason: "batched KV write offset overflow".to_owned(),
+        })?;
+    let write_end =
+        write_start
+            .checked_add(total_elems)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: write_start,
+                byte_len: total_elems.saturating_mul(size_of::<f32>()),
+                buffer_len: k_plane_mut.len(),
+                reason: "batched KV write end overflow".to_owned(),
+            })?;
+    if write_end > k_plane_mut.len() || write_end > v_plane_mut.len() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: write_start,
+            byte_len: total_elems.saturating_mul(size_of::<f32>()),
+            buffer_len: k_plane_mut.len().min(v_plane_mut.len()),
+            reason: format!(
+                "batched KV write range [{write_start}..{write_end}) exceeds plane length {}",
+                k_plane_mut.len()
+            ),
+        });
+    }
+    k_plane_mut[write_start..write_end].copy_from_slice(&k_batch[..total_elems]);
+    v_plane_mut[write_start..write_end].copy_from_slice(&v_batch[..total_elems]);
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared causal GQA single-row accumulation across KV plane"
+)]
+fn accumulate_causal_gqa_row(
+    out_row: &mut [f32],
+    q_row: &[f32],
+    k_plane: &[f32],
+    v_plane: &[f32],
+    query_pos: usize,
+    num_heads: usize,
+    kv_group_size: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    sliding_window: Option<usize>,
+    attn_scale: f32,
+    scores_scratch: &mut [f32],
+) {
+    let valid_end = query_pos + 1;
+    let window_start = sliding_window.map_or(0, |swa| valid_end.saturating_sub(swa));
+    let scores = &mut scores_scratch[..valid_end - window_start];
 
     for h in 0..num_heads {
         let kh = h / kv_group_size;
-        let q_head = &q[h * head_dim..(h + 1) * head_dim];
-        let mut scores = Vec::with_capacity(valid_len - window_start);
+        let q_head = &q_row[h * head_dim..(h + 1) * head_dim];
         let mut max_score = f32::NEG_INFINITY;
 
-        for t in window_start..valid_len {
+        for (slot, t) in scores.iter_mut().zip(window_start..valid_end) {
             let t_k_off = t * kv_dim + kh * head_dim;
             let k_head = &k_plane[t_k_off..t_k_off + head_dim];
-            let dot = quant::dot_product_f32(q_head, k_head);
-            let sc = dot * attn_scale;
+            let sc = quant::dot_product_f32(q_head, k_head) * attn_scale;
             if sc > max_score {
                 max_score = sc;
             }
-            scores.push(sc);
+            *slot = sc;
         }
 
         let mut sum_exp = 0.0_f32;
-        for sc in &mut scores {
+        for sc in scores.iter_mut() {
             *sc = (*sc - max_score).exp();
             sum_exp += *sc;
         }
@@ -1634,9 +2255,10 @@ fn run_dory_attention_cached_with_kv_view(
             0.0
         };
 
-        let out_head = &mut attn_heads_out[h * head_dim..(h + 1) * head_dim];
-        for (idx, t) in (window_start..valid_len).enumerate() {
-            let prob = scores[idx] * inv_sum;
+        let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
+        out_head.fill(0.0_f32);
+        for (&exp_score, t) in scores.iter().zip(window_start..valid_end) {
+            let prob = exp_score * inv_sum;
             let t_v_off = t * kv_dim + kh * head_dim;
             let v_head = &v_plane[t_v_off..t_v_off + head_dim];
             for (o, &vv) in out_head.iter_mut().zip(v_head.iter()) {
@@ -1644,27 +2266,33 @@ fn run_dory_attention_cached_with_kv_view(
             }
         }
     }
+}
 
-    // Sigmoid attention output gating: attn * sigmoid(gate * (attn_gate_scale * sqrt(gate_init) / init_std)^2)
-    let gate_scale = attn_gate.as_slice();
-    let sqrt_gate_init = if recipe.gate_init > 0.0 {
-        recipe.gate_init.sqrt()
+fn apply_attention_sigmoid_gate_and_norm(
+    attn_heads_out: &mut [f32],
+    gate: &[f32],
+    gate_scale: &[f32],
+    m: usize,
+    q_dim: usize,
+    gate_init: f32,
+    init_std: f32,
+) {
+    let sqrt_gate_init = if gate_init > 0.0 {
+        gate_init.sqrt()
     } else {
         1.0
     };
-    for i in 0..q_dim {
-        let gs = gate_scale[i] * sqrt_gate_init / init_std;
-        let scaled_gate = gate[i] * (gs * gs);
-        let sig = 1.0_f32 / (1.0_f32 + (-scaled_gate).exp());
-        attn_heads_out[i] *= sig;
+    for row_m in 0..m {
+        let attn_row = &mut attn_heads_out[row_m * q_dim..(row_m + 1) * q_dim];
+        let gate_row = &gate[row_m * q_dim..(row_m + 1) * q_dim];
+        for i in 0..q_dim {
+            let gs = gate_scale[i] * sqrt_gate_init / init_std;
+            let scaled_gate = gate_row[i] * (gs * gs);
+            let sig = 1.0_f32 / (1.0_f32 + (-scaled_gate).exp());
+            attn_row[i] *= sig;
+        }
+        l2_normalize_in_place(attn_row, DORY_L2_EPS);
     }
-
-    // L2 normalize gated attention output before attn_output projection
-    l2_normalize_in_place(&mut attn_heads_out, DORY_L2_EPS);
-    let mut sub_out = vec![0.0_f32; hidden_dim];
-    wo.project_f32(&mut sub_out, &attn_heads_out)?;
-    l2_normalize_in_place(&mut sub_out, DORY_L2_EPS);
-    Ok(sub_out)
 }
 
 /// Executes a disaggregated Dory nGPT `SwiGLU` MLP sub-layer (`'-'`):
@@ -1685,7 +2313,6 @@ pub fn run_dory_mlp_sublayer(
     run_dory_mlp_cached(recipe, cur, &sublayer)
 }
 
-#[expect(clippy::cast_precision_loss, reason = "hidden_dim fits cleanly in f32")]
 fn run_dory_mlp_cached(
     recipe: &DoryRecipe,
     cur: &[f32],
@@ -1712,42 +2339,181 @@ fn run_dory_mlp_cached(
 
     let hidden_dim = cur.len();
     let ffn_dim = (recipe.ffn_dim as usize).max(1);
-    if suv.len() != ffn_dim || mlp_gate.len() != ffn_dim {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: format!("blk.{physical_idx}.ffn_up_scale.weight"),
-            offset: 0,
-            byte_len: suv.len(),
-            buffer_len: ffn_dim,
-            reason: format!(
-                "cached MLP scale lengths (suv={}, mlp_gate={}) != ffn_dim {ffn_dim}",
-                suv.len(),
-                mlp_gate.len()
-            ),
-        });
-    }
+    validate_mlp_scales(*physical_idx, suv.len(), mlp_gate.len(), ffn_dim)?;
 
     let mut gate = vec![0.0_f32; ffn_dim];
     let mut up = vec![0.0_f32; ffn_dim];
     wgate.project_f32(&mut gate, cur)?;
     wup.project_f32(&mut up, cur)?;
 
-    let sqrt_embd = (hidden_dim as f32).sqrt();
-    let gate_scale = mlp_gate.as_slice();
-    let up_scale = suv.as_slice();
+    let mut hidden_ffn = vec![0.0_f32; ffn_dim];
+    apply_mlp_swiglu_and_norm(
+        &mut hidden_ffn,
+        &gate,
+        &up,
+        mlp_gate.as_slice(),
+        suv.as_slice(),
+        1,
+        ffn_dim,
+        hidden_dim,
+    );
 
-    let mut hidden_ffn = Vec::with_capacity(ffn_dim);
-    for i in 0..ffn_dim {
-        let g = gate[i] * (gate_scale[i] * sqrt_embd);
-        let u = up[i] * (up_scale[i] * sqrt_embd);
-        let silu_g = g / (1.0_f32 + (-g).exp());
-        hidden_ffn.push(silu_g * u);
-    }
-
-    l2_normalize_in_place(&mut hidden_ffn, DORY_L2_EPS);
     let mut sub_out = vec![0.0_f32; hidden_dim];
     wdown.project_f32(&mut sub_out, &hidden_ffn)?;
     l2_normalize_in_place(&mut sub_out, DORY_L2_EPS);
     Ok(sub_out)
+}
+
+fn validate_batched_input_len(
+    cur: &[f32],
+    m: usize,
+    hidden_dim: usize,
+    physical_idx: u32,
+    suffix: &str,
+) -> Result<(), K3Error> {
+    if cur.len() != m * hidden_dim {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: format!("blk.{physical_idx}.{suffix}"),
+            offset: 0,
+            byte_len: size_of_val(cur),
+            buffer_len: m
+                .saturating_mul(hidden_dim)
+                .saturating_mul(size_of::<f32>()),
+            reason: format!(
+                "batched input len {} != m ({m}) * hidden_dim ({hidden_dim})",
+                cur.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_attention_scales(
+    physical_idx: u32,
+    sqk_len: usize,
+    attn_gate_len: usize,
+    q_dim: usize,
+) -> Result<(), K3Error> {
+    if sqk_len != q_dim || attn_gate_len != q_dim {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: format!("blk.{physical_idx}.attn_qk_scale.weight"),
+            offset: 0,
+            byte_len: sqk_len,
+            buffer_len: q_dim,
+            reason: format!(
+                "cached attention scale lengths (sqk={sqk_len}, attn_gate={attn_gate_len}) != q_dim {q_dim}",
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_mlp_scales(
+    physical_idx: u32,
+    suv_len: usize,
+    mlp_gate_len: usize,
+    ffn_dim: usize,
+) -> Result<(), K3Error> {
+    if suv_len != ffn_dim || mlp_gate_len != ffn_dim {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: format!("blk.{physical_idx}.ffn_up_scale.weight"),
+            offset: 0,
+            byte_len: suv_len,
+            buffer_len: ffn_dim,
+            reason: format!(
+                "cached MLP scale lengths (suv={suv_len}, mlp_gate={mlp_gate_len}) != ffn_dim {ffn_dim}",
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn run_dory_mlp_batched_cached(
+    recipe: &DoryRecipe,
+    cur: &[f32],
+    m: usize,
+    sublayer: &DoryPhysicalSubLayer,
+    scratch: &mut DoryPrefillScratch,
+) -> Result<(), K3Error> {
+    let DoryPhysicalSubLayer::Mlp {
+        physical_idx,
+        wup,
+        wgate,
+        wdown,
+        suv,
+        mlp_gate,
+        ..
+    } = sublayer
+    else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!(
+                "expected Mlp physical sublayer at {}, found Attention",
+                sublayer.physical_idx()
+            ),
+        });
+    };
+
+    let hidden_dim = (recipe.hidden_dim as usize).max(2);
+    let ffn_dim = (recipe.ffn_dim as usize).max(1);
+    validate_batched_input_len(cur, m, hidden_dim, *physical_idx, "ffn_input")?;
+    validate_mlp_scales(*physical_idx, suv.len(), mlp_gate.len(), ffn_dim)?;
+
+    scratch.ensure_mlp(m, ffn_dim);
+
+    // Quantize [M, hidden_dim] activations once and reuse across ffn_gate and ffn_up.
+    scratch.act_batch.prepare_into(cur, m, hidden_dim)?;
+    wgate.project_batch_prepared(&mut scratch.mlp_gate, &scratch.act_batch)?;
+    wup.project_batch_prepared(&mut scratch.mlp_up, &scratch.act_batch)?;
+
+    apply_mlp_swiglu_and_norm(
+        &mut scratch.hidden_ffn,
+        &scratch.mlp_gate,
+        &scratch.mlp_up,
+        mlp_gate.as_slice(),
+        suv.as_slice(),
+        m,
+        ffn_dim,
+        hidden_dim,
+    );
+
+    scratch
+        .act_batch
+        .prepare_into(&scratch.hidden_ffn, m, ffn_dim)?;
+    wdown.project_batch_prepared(&mut scratch.sub_out, &scratch.act_batch)?;
+    l2_normalize_rows_in_place(&mut scratch.sub_out, hidden_dim, DORY_L2_EPS);
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    reason = "shared batched SwiGLU + hyperspherical L2 normalization across M rows"
+)]
+fn apply_mlp_swiglu_and_norm(
+    hidden_ffn: &mut [f32],
+    gate: &[f32],
+    up: &[f32],
+    gate_scale: &[f32],
+    up_scale: &[f32],
+    m: usize,
+    ffn_dim: usize,
+    hidden_dim: usize,
+) {
+    let sqrt_embd = (hidden_dim as f32).sqrt();
+    for row_m in 0..m {
+        let base = row_m * ffn_dim;
+        let out_row = &mut hidden_ffn[base..base + ffn_dim];
+        let gate_row = &gate[base..base + ffn_dim];
+        let up_row = &up[base..base + ffn_dim];
+        for i in 0..ffn_dim {
+            let g = gate_row[i] * (gate_scale[i] * sqrt_embd);
+            let u = up_row[i] * (up_scale[i] * sqrt_embd);
+            let silu_g = g / (1.0_f32 + (-g).exp());
+            out_row[i] = silu_g * u;
+        }
+        l2_normalize_in_place(out_row, DORY_L2_EPS);
+    }
 }
 
 /// Applies `NeoX` half-split rotary positional embeddings (`(x[i], x[i + d/2])`) in place.

@@ -14,7 +14,8 @@ use std::ops::Deref;
 use jero_core::{GgufArray, GgufFile, K3Error, ModelWeights, QuantType, StopCriteria, TensorView};
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    RepackedWeight, gemm_repacked_f32, gemv_repacked_f32, gemv_repacked_f32_rows,
+    QuantizedActQ8, RepackedWeight, gemm_repacked_f32, gemm_repacked_rows, gemv_repacked_f32,
+    gemv_repacked_f32_rows,
 };
 
 use crate::quant;
@@ -583,6 +584,125 @@ impl DoryCachedWeight {
             }
             Ok(())
         }
+    }
+
+    /// Evaluates batched multi-token GEMM (`[M, cols] x [rows, cols]^T -> [M, rows]`) from a
+    /// pre-quantized `QuantizedActQ8` activation buffer via `gemm_repacked_rows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn project_batch_act(
+        &self,
+        output: &mut [f32],
+        act: &QuantizedActQ8,
+    ) -> Result<(), K3Error> {
+        gemm_repacked_rows(output, &self.inner, act, 0..self.inner.rows())
+    }
+
+    /// Evaluates batched multi-token GEMM (`[M, cols] x [rows, cols]^T -> [M, rows]`) from a
+    /// prepared [`DoryBatchAct`] scratch buffer, reusing activation quantization across sibling
+    /// projections (`Wq`/`Wk`/`Wv`/`Wgate` and `Wup`/`Wgate`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    pub fn project_batch_prepared(
+        &self,
+        output: &mut [f32],
+        act: &DoryBatchAct,
+    ) -> Result<(), K3Error> {
+        #[cfg(feature = "with-kernels")]
+        {
+            self.project_batch_act(output, &act.inner)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            self.project_batch_f32(output, &act.raw, act.m)
+        }
+    }
+}
+
+/// Reusable batched `[M, K]` activation scratch container shared across sibling GEMM projections.
+///
+/// Under `with-kernels`, wraps `QuantizedActQ8` (`quantize_into`) so sibling projections (`Wq`, `Wk`,
+/// `Wv`, `Wgate` or `Wup`, `Wgate`) quantize activations once per sub-layer while reusing heap
+/// allocations across layers. Under `--no-default-features`, retains validated row-major `f32`
+/// activations for uniform batched execution.
+#[derive(Debug, Clone, Default)]
+pub struct DoryBatchAct {
+    #[cfg(feature = "with-kernels")]
+    inner: QuantizedActQ8,
+    #[cfg(not(feature = "with-kernels"))]
+    raw: Vec<f32>,
+    m: usize,
+    k: usize,
+}
+
+impl DoryBatchAct {
+    /// Creates an empty reusable [`DoryBatchAct`] buffer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(feature = "with-kernels")]
+            inner: QuantizedActQ8::new(),
+            #[cfg(not(feature = "with-kernels"))]
+            raw: Vec::new(),
+            m: 0,
+            k: 0,
+        }
+    }
+
+    /// Prepares `[m, k]` row-major `f32` activations into `self`, reusing prior allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `m == 0`, `k == 0`, or `act.len() != m * k`.
+    pub fn prepare_into(&mut self, act: &[f32], m: usize, k: usize) -> Result<(), K3Error> {
+        let expected = m.checked_mul(k).ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "DoryBatchAct".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(act),
+            buffer_len: usize::MAX,
+            reason: "m * k overflow preparing DoryBatchAct".to_owned(),
+        })?;
+        if m == 0 || k == 0 || act.len() != expected {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "DoryBatchAct".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(act),
+                buffer_len: expected.saturating_mul(size_of::<f32>()),
+                reason: format!(
+                    "batched activation length {} != m ({m}) * k ({k})",
+                    act.len()
+                ),
+            });
+        }
+        #[cfg(feature = "with-kernels")]
+        {
+            self.inner.quantize_into(act, m, k)?;
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            self.raw.clear();
+            self.raw.extend_from_slice(act);
+        }
+        self.m = m;
+        self.k = k;
+        Ok(())
+    }
+
+    /// Returns the number of token rows `M` currently stored.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.m
+    }
+
+    /// Returns the logical feature width `K` currently stored.
+    #[must_use]
+    pub const fn cols(&self) -> usize {
+        self.k
     }
 }
 
