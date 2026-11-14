@@ -1,12 +1,16 @@
 //! NVIDIA Nemotron-Labs Dory1.0 looped latent-recurrent nGPT recipe (`dory`).
 
-use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use std::borrow::Cow;
+
+use jero_core::{
+    ArchRecipe, ExecutionContext, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
+    ModelMetadata, ModelWeights, QuantType, TensorView,
+};
 
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{
-    BaselineKernel, VectorKernel, bf16_to_f32_finite, dequantize_q5_k_block, dequantize_q6_k_block,
-    dequantize_q8_0_block, l2_norm_f32_in_place, ngpt_residual_lerp_in_place, vec_dot_q5_k,
-};
+use jero_kernels_rvv::{l2_norm_f32_in_place, ngpt_residual_lerp_in_place};
+
+use crate::quant;
 
 /// Canonical 72-layer disaggregated sub-layer pattern for `Dory1.0-4B`.
 pub const CANONICAL_DORY_LAYER_PATTERN: &str =
@@ -26,6 +30,15 @@ pub enum DoryKvCacheMode {
 }
 
 impl DoryKvCacheMode {
+    /// Converts from `jero_core::DoryKvCacheMode` to `DoryKvCacheMode`.
+    #[must_use]
+    pub const fn from_core(mode: jero_core::DoryKvCacheMode) -> Self {
+        match mode {
+            jero_core::DoryKvCacheMode::PerLoop => Self::PerLoop,
+            jero_core::DoryKvCacheMode::LastLoop => Self::LastLoop,
+        }
+    }
+
     /// Parses the GGUF `dory.recurrent_kv_cache_mode` string (`"per_loop"` or `"last_loop"`).
     ///
     /// # Errors
@@ -53,12 +66,12 @@ impl DoryKvCacheMode {
     }
 }
 
-/// Disaggregated sub-layer kind in `dory.layer_pattern` (`'S'`, `'*'`, `'-'`).
+/// Disaggregated sub-layer kind in `dory.layer_pattern` (`'S'`, `'*'` / `'g'`, `'-'`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DorySubLayerKind {
     /// Sliding-window GQA attention sub-layer (`'S'`, bounded by `sliding_window`).
     SlidingAttention,
-    /// Full-context GQA attention sub-layer (`'*'`).
+    /// Full-context GQA attention sub-layer (`'*'` or `'g'`).
     FullAttention,
     /// Gated `SwiGLU` MLP sub-layer (`'-'`, zero KV cache allocation).
     Mlp,
@@ -68,22 +81,22 @@ impl DorySubLayerKind {
     /// Parses a single character from `dory.layer_pattern`.
     ///
     /// # Errors
-    /// Returns [`K3Error::CapabilityMismatch`] if `ch` is not `'S'`, `'*'`, or `'-'`.
+    /// Returns [`K3Error::CapabilityMismatch`] if `ch` is not `'S'`, `'*'`, `'g'`, or `'-'`.
     pub fn from_pattern_char(ch: char) -> Result<Self, K3Error> {
         match ch {
             'S' => Ok(Self::SlidingAttention),
-            '*' => Ok(Self::FullAttention),
+            '*' | 'g' => Ok(Self::FullAttention),
             '-' => Ok(Self::Mlp),
             _ => Err(K3Error::CapabilityMismatch {
                 architecture: "dory".to_owned(),
                 reason: format!(
-                    "invalid character '{ch}' in dory.layer_pattern (expected 'S', '*', or '-')"
+                    "invalid character '{ch}' in dory.layer_pattern (expected 'S', '*', 'g', or '-')"
                 ),
             }),
         }
     }
 
-    /// Returns `true` if this sub-layer allocates KV cache entries (`'S'` or `'*'`).
+    /// Returns `true` if this sub-layer allocates KV cache entries (`'S'`, `'*'`, or `'g'`).
     #[must_use]
     pub const fn has_kv_cache(self) -> bool {
         matches!(self, Self::SlidingAttention | Self::FullAttention)
@@ -117,23 +130,13 @@ pub fn f16_bits_to_f32_finite(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | (e << 23) | (mant << 13))
 }
 
-#[cfg(not(feature = "with-kernels"))]
-fn bf16_to_f32_finite(bits: u16) -> f32 {
-    let exp = (bits >> 7) & 0x00FF;
-    let sign = (bits >> 15) & 0x0001;
-    if exp == 0x00FF {
-        return if sign == 1 { -0.0625 } else { 0.0625 };
-    }
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 /// Extracts a 1D scale vector (`F32`, `F16`, or `BF16`) from `weights` and converts it to `Vec<f32>`.
 ///
 /// # Errors
 ///
-/// Returns [`K3Error::TensorBoundsError`] if the tensor is missing or its element count does not
-/// match `expected_len`. Returns [`K3Error::CapabilityMismatch`] if the tensor quantization format
-/// is not `F32`, `F16`, or `BF16`.
+/// Returns [`K3Error::TensorBoundsError`] if the tensor is missing, truncated, or its element count
+/// does not match `expected_len`. Returns [`K3Error::CapabilityMismatch`] if the tensor quantization
+/// format is not `F32`, `F16`, or `BF16`.
 pub fn extract_scale_vector_f32(
     weights: &dyn ModelWeights,
     name: &str,
@@ -154,35 +157,51 @@ pub fn extract_scale_vector_f32(
     }
 
     let raw = view.as_bytes();
-    let mut out = Vec::with_capacity(expected_len);
-    match view.quant() {
-        QuantType::F32 => {
-            for i in 0..expected_len {
-                let off = i * 4;
-                let b = &raw[off..off + 4];
-                out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-            }
-        }
-        QuantType::F16 => {
-            for i in 0..expected_len {
-                let off = i * 2;
-                let bits = u16::from_le_bytes([raw[off], raw[off + 1]]);
-                out.push(f16_bits_to_f32_finite(bits));
-            }
-        }
-        QuantType::BF16 => {
-            for i in 0..expected_len {
-                let off = i * 2;
-                let bits = u16::from_le_bytes([raw[off], raw[off + 1]]);
-                out.push(bf16_to_f32_finite(bits));
-            }
-        }
+    let elem_bytes = match view.quant() {
+        QuantType::F32 => 4,
+        QuantType::F16 | QuantType::BF16 => 2,
         other => {
             return Err(K3Error::CapabilityMismatch {
                 architecture: "dory".to_owned(),
                 reason: format!("1D scale vector '{name}' must be F32, F16, or BF16, got {other}"),
             });
         }
+    };
+    let required_bytes = expected_len.saturating_mul(elem_bytes);
+    if raw.len() < required_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: view.offset(),
+            byte_len: required_bytes,
+            buffer_len: raw.len(),
+            reason: format!(
+                "scale vector '{name}' byte length {} smaller than required {required_bytes}",
+                raw.len()
+            ),
+        });
+    }
+
+    let mut out = Vec::with_capacity(expected_len);
+    match view.quant() {
+        QuantType::F32 => {
+            for b in raw[..required_bytes].chunks_exact(4) {
+                let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                out.push(if val.is_finite() { val } else { 0.0 });
+            }
+        }
+        QuantType::F16 => {
+            for b in raw[..required_bytes].chunks_exact(2) {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                out.push(f16_bits_to_f32_finite(bits));
+            }
+        }
+        QuantType::BF16 => {
+            for b in raw[..required_bytes].chunks_exact(2) {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                out.push(quant::bf16_to_f32_finite(bits));
+            }
+        }
+        _ => unreachable!(),
     }
 
     Ok(out)
@@ -313,6 +332,9 @@ impl<'a> DoryPhysicalLayerWeights<'a> {
     }
 }
 
+/// Canonical vocabulary size for `Dory1.0-4B` (`131,072`).
+pub const DORY_DEFAULT_VOCAB_SIZE: usize = 131_072;
+
 /// Architecture recipe for NVIDIA Nemotron-Labs `Dory1.0-4B` (`general.architecture = "dory"`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoryRecipe {
@@ -348,8 +370,14 @@ pub struct DoryRecipe {
     pub gate_init: f32,
     /// Active KV cache mode (`per_loop` by default, or `last_loop`).
     pub kv_cache_mode: DoryKvCacheMode,
-    /// Disaggregated sub-layer pattern string (`'S'`, `'*'`, `'-'`).
-    pub layer_pattern: &'static str,
+    /// Disaggregated sub-layer pattern string (`'S'`, `'*'`, `'g'`, `'-'`).
+    pub layer_pattern: Cow<'static, str>,
+    /// `RoPE` profile identifier parsed from `dory.rope.profile` (default `"dual_theta"`).
+    pub rope_profile: Cow<'static, str>,
+    /// Model vocabulary size (`dory.vocab_size` or `token_embd.weight` rows, default `131_072`).
+    pub vocab_size: usize,
+    /// Optional explicit final logit multiplier (`dory.logit_scale`).
+    pub logit_scale: Option<f32>,
 }
 
 impl Default for DoryRecipe {
@@ -379,8 +407,200 @@ impl DoryRecipe {
             alpha_init: 0.05,
             gate_init: 50.596_443,
             kv_cache_mode: DoryKvCacheMode::PerLoop,
-            layer_pattern: CANONICAL_DORY_LAYER_PATTERN,
+            layer_pattern: Cow::Borrowed(CANONICAL_DORY_LAYER_PATTERN),
+            rope_profile: Cow::Borrowed("dual_theta"),
+            vocab_size: DORY_DEFAULT_VOCAB_SIZE,
+            logit_scale: None,
         }
+    }
+
+    /// Parses `dory.rope.profile` across string, unsigned/non-negative signed integer (`u32`/`i32`),
+    /// returning a canonical profile identifier (`"dual_theta"`, `"neox"`, `"profile_{n}"`, etc.).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if `val` is empty or neither a string nor a
+    /// non-negative integer.
+    pub fn parse_rope_profile(val: &GgufValue<'_>) -> Result<Cow<'static, str>, K3Error> {
+        if let Some(s) = val.as_str() {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "dory".to_owned(),
+                    reason: "dory.rope.profile string must not be empty".to_owned(),
+                });
+            }
+            return Ok(Cow::Owned(trimmed.to_owned()));
+        }
+        if let Some(u) = val.as_u32() {
+            return Ok(Cow::Owned(format!("profile_{u}")));
+        }
+        Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: "dory.rope.profile must be a string or non-negative integer".to_owned(),
+        })
+    }
+
+    /// Hydrates a [`DoryRecipe`] from parsed [`ModelMetadata`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if the metadata architecture is not `"dory"` or if
+    /// hyperparameters / `dory.layer_pattern` are malformed.
+    pub fn from_metadata(metadata: &ModelMetadata) -> Result<Self, K3Error> {
+        if metadata.architecture() != "dory" {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: metadata.architecture().to_owned(),
+                reason: format!(
+                    "expected architecture 'dory', got '{}'",
+                    metadata.architecture()
+                ),
+            });
+        }
+
+        let mut recipe = Self::new();
+        if let Some(dory) = metadata.dory() {
+            recipe.n_input_layers = dory.input_layer_count();
+            recipe.n_recurrent_layers = dory.recurrent_layer_count();
+            recipe.n_output_layers = dory.output_layer_count();
+            recipe.n_loops = dory.num_loops();
+            recipe.kv_cache_mode = DoryKvCacheMode::from_core(dory.recurrent_kv_cache_mode());
+            recipe.layer_pattern = Cow::Owned(dory.layer_pattern().to_owned());
+            let profile = dory.rope_profile().trim();
+            if profile.is_empty() {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "dory".to_owned(),
+                    reason: "dory.rope.profile must not be empty".to_owned(),
+                });
+            }
+            recipe.rope_profile = Cow::Owned(profile.to_owned());
+            recipe.rope_theta_swa = dory.rope_freq_base_2();
+            recipe.init_std = dory.init_std();
+            recipe.alpha_init = dory.alpha_init();
+            recipe.gate_init = dory.gate_init();
+        }
+
+        if let Ok(dim) = u32::try_from(metadata.embedding_dim())
+            && dim > 0
+        {
+            recipe.hidden_dim = dim;
+        }
+        if let Some(ffn) = metadata
+            .feed_forward_length()
+            .and_then(|v| u32::try_from(v).ok())
+            && ffn > 0
+        {
+            recipe.ffn_dim = ffn;
+        }
+        if let Ok(nh) = u32::try_from(metadata.head_count())
+            && nh > 0
+        {
+            recipe.num_heads = nh;
+        }
+        if let Ok(nkv) = u32::try_from(metadata.head_count_kv())
+            && nkv > 0
+        {
+            recipe.num_kv_heads = nkv;
+        }
+        if let Some(kl) = metadata
+            .key_length()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            recipe.head_dim = kl;
+        } else if recipe.hidden_dim != 2560 && recipe.num_heads > 0 {
+            recipe.head_dim = (recipe.hidden_dim / recipe.num_heads).max(2);
+        }
+        if let Some(sw) = metadata
+            .sliding_window()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            recipe.sliding_window = sw;
+        }
+        if let Some(freq) = metadata
+            .rope_freq_base()
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            recipe.rope_theta_full = freq;
+        }
+        if let Some(vs) = metadata.vocab_size().filter(|&v| v > 0) {
+            recipe.vocab_size = vs;
+        } else if let Some(embd) = metadata.find_tensor("token_embd.weight")
+            && embd.shape().len() == 2
+        {
+            let hidden = recipe.hidden_dim as usize;
+            let (d0, d1) = (embd.shape()[0], embd.shape()[1]);
+            if d0 == hidden && d1 > 0 {
+                recipe.vocab_size = d1;
+            } else if d1 == hidden && d0 > 0 {
+                recipe.vocab_size = d0;
+            }
+        }
+        if let Some(ls) = metadata.logit_scale().filter(|v| v.is_finite() && *v > 0.0) {
+            recipe.logit_scale = Some(ls);
+        }
+
+        recipe.validate_hyperparams()?;
+        Ok(recipe)
+    }
+
+    /// Hydrates a [`DoryRecipe`] directly from a parsed [`GgufFile`], honoring string/integer/default
+    /// `dory.rope.profile` encodings, dual-theta SWA/global `RoPE` frequencies, dynamic
+    /// `dory.layer_pattern`, and `n_loops` / `kv_sharing` overrides.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if metadata keys or hyperparameters are invalid.
+    pub fn from_gguf(gguf: &GgufFile<'_>) -> Result<Self, K3Error> {
+        let mut recipe = Self::from_metadata(gguf.metadata())?;
+
+        if let Some(val) = gguf.metadata_value("dory.rope.profile") {
+            recipe.rope_profile = Self::parse_rope_profile(val)?;
+        }
+        if let Some(val) = gguf.metadata_value("dory.rope.freq_base_2") {
+            let f = val.as_f32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory.rope.freq_base_2 must be a float".to_owned(),
+            })?;
+            recipe.rope_theta_swa = f;
+        }
+        if let Some(val) = gguf.metadata_value("dory.rope.freq_base") {
+            let f = val.as_f32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory.rope.freq_base must be a float".to_owned(),
+            })?;
+            recipe.rope_theta_full = f;
+        }
+        if let Some(val) = gguf.metadata_value("dory.attention.sliding_window")
+            && let Some(sw) = val.as_u32()
+        {
+            recipe.sliding_window = sw;
+        }
+        if let Some(val) = gguf.metadata_value("dory.n_loops") {
+            let loops = val.as_u32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory.n_loops must be an integer in 1..=4".to_owned(),
+            })?;
+            recipe = recipe.with_loops(loops)?;
+        }
+        if let Some(val) = gguf
+            .metadata_value("dory.kv_sharing")
+            .or_else(|| gguf.metadata_value("dory.recurrent_kv_cache_mode"))
+        {
+            let mode_str = val.as_str().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory KV cache sharing mode must be a string".to_owned(),
+            })?;
+            recipe.kv_cache_mode = DoryKvCacheMode::parse_gguf(mode_str)?;
+        }
+        if let Some(val) = gguf.metadata_value("dory.logit_scale") {
+            let ls = val.as_f32().ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory.logit_scale must be a float".to_owned(),
+            })?;
+            recipe.logit_scale = Some(ls);
+        }
+
+        recipe.validate_hyperparams()?;
+        Ok(recipe)
     }
 
     /// Returns a copy of this recipe with an overridden recurrent loop count (`1..=4`).
@@ -405,11 +625,110 @@ impl DoryRecipe {
         self
     }
 
-    /// Returns a copy of this recipe with a custom sub-layer pattern string.
+    /// Returns a copy of this recipe with a static sub-layer pattern string.
     #[must_use]
-    pub const fn with_layer_pattern(mut self, pattern: &'static str) -> Self {
-        self.layer_pattern = pattern;
+    pub fn with_layer_pattern(mut self, pattern: &'static str) -> Self {
+        self.layer_pattern = Cow::Borrowed(pattern);
         self
+    }
+
+    /// Returns a copy of this recipe with a borrowed or heap-owned dynamic sub-layer pattern string.
+    #[must_use]
+    pub fn with_layer_pattern_owned(mut self, pattern: impl Into<Cow<'static, str>>) -> Self {
+        self.layer_pattern = pattern.into();
+        self
+    }
+
+    /// Returns a copy of this recipe with an explicit `RoPE` profile identifier.
+    #[must_use]
+    pub fn with_rope_profile(mut self, profile: impl Into<Cow<'static, str>>) -> Self {
+        self.rope_profile = profile.into();
+        self
+    }
+
+    /// Validates recipe hyperparameters and `layer_pattern` consistency.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if any dimension, loop count, `RoPE` parameter, or
+    /// pattern entry is invalid.
+    pub fn validate_hyperparams(&self) -> Result<(), K3Error> {
+        if self.n_loops == 0 || self.n_loops > 4 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!("dory.num_loops must be in 1..=4, got {}", self.n_loops),
+            });
+        }
+        if self.hidden_dim < 2
+            || self.ffn_dim == 0
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || self.num_heads % self.num_kv_heads != 0
+            || self.head_dim < 2
+            || self.sliding_window == 0
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "Dory architecture dimensions must be valid positive multiples".to_owned(),
+            });
+        }
+        if !self.rope_theta_full.is_finite()
+            || self.rope_theta_full <= 0.0
+            || !self.rope_theta_swa.is_finite()
+            || self.rope_theta_swa <= 0.0
+            || !self.init_std.is_finite()
+            || self.init_std <= 0.0
+            || !self.alpha_init.is_finite()
+            || !self.gate_init.is_finite()
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "Dory RoPE/initializer constants must be positive finite values".to_owned(),
+            });
+        }
+        if let Some(ls) = self.logit_scale
+            && (!ls.is_finite() || ls <= 0.0)
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!("dory.logit_scale must be positive and finite, got {ls}"),
+            });
+        }
+        self.validate_layer_pattern()
+    }
+
+    /// Validates that `layer_pattern` covers every physical sub-layer `0..physical_layer_count()`
+    /// using only valid tokens (`'S'`, `'*'`, `'g'`, `'-'`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if `physical_layer_count() == 0`, `layer_pattern`
+    /// is shorter than `physical_layer_count()`, or any character is unrecognized.
+    pub fn validate_layer_pattern(&self) -> Result<(), K3Error> {
+        let physical = self.physical_layer_count() as usize;
+        if physical == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: "dory physical layer count must be non-zero".to_owned(),
+            });
+        }
+        let pattern_chars: Vec<char> = self.layer_pattern.chars().collect();
+        if pattern_chars.len() < physical {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!(
+                    "dory.layer_pattern length ({}) is shorter than physical layer count ({physical})",
+                    pattern_chars.len()
+                ),
+            });
+        }
+        for (p, &ch) in pattern_chars.iter().take(physical).enumerate() {
+            DorySubLayerKind::from_pattern_char(ch).map_err(|_| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!(
+                    "invalid character '{ch}' at physical sub-layer {p} in dory.layer_pattern"
+                ),
+            })?;
+        }
+        Ok(())
     }
 
     /// Total number of physical sub-layers stored in weight tensors (`n_input + n_recurrent + n_output`).
@@ -426,6 +745,106 @@ impl DoryRecipe {
         self.n_input_layers
             .saturating_add(self.n_recurrent_layers.saturating_mul(self.n_loops))
             .saturating_add(self.n_output_layers)
+    }
+
+    /// Counts how many physical attention sub-layers (`'S'`, `'*'`, `'g'`) appear within `[start..end)`.
+    fn count_attention_in_physical_range(&self, start: u32, end: u32) -> Result<usize, K3Error> {
+        let mut count = 0_usize;
+        for p in start..end {
+            if self.sublayer_kind(p)?.has_kv_cache() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Returns the compact count of KV cache slots allocated strictly for attention sub-layers
+    /// (`'S'`, `'*'`, `'g'`) across the configured loops and [`DoryKvCacheMode`], excluding all
+    /// `'-'` MLP sub-layers (and sharing recurrent attention slots in [`DoryKvCacheMode::LastLoop`]).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if `layer_pattern` is malformed or truncated.
+    pub fn attention_kv_layer_count(&self) -> Result<usize, K3Error> {
+        let rec_start = self.n_input_layers;
+        let out_start = rec_start.saturating_add(self.n_recurrent_layers);
+        let n_physical = self.physical_layer_count();
+
+        let in_attn = self.count_attention_in_physical_range(0, rec_start)?;
+        let rec_attn = self.count_attention_in_physical_range(rec_start, out_start)?;
+        let out_attn = self.count_attention_in_physical_range(out_start, n_physical)?;
+
+        let rec_slots = match self.kv_cache_mode {
+            DoryKvCacheMode::PerLoop => rec_attn.saturating_mul(self.n_loops as usize),
+            DoryKvCacheMode::LastLoop => rec_attn,
+        };
+        Ok(in_attn.saturating_add(rec_slots).saturating_add(out_attn))
+    }
+
+    /// Maps a virtual execution sub-layer index (`0..virtual_layer_count()`) to its compact
+    /// attention-only KV cache slot index (`0..attention_kv_layer_count()`), or `None` if the
+    /// underlying sub-layer is an MLP (`'-'`) with no KV state.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if `virtual_idx >= self.virtual_layer_count()` or
+    /// `layer_pattern` is invalid.
+    pub fn virtual_to_attention_kv_slot(&self, virtual_idx: u32) -> Result<Option<usize>, K3Error> {
+        let physical = self.virtual_to_physical_layer(virtual_idx)?;
+        if !self.sublayer_kind(physical)?.has_kv_cache() {
+            return Ok(None);
+        }
+
+        let rec_start = self.n_input_layers;
+        let out_phys_start = rec_start.saturating_add(self.n_recurrent_layers);
+        let in_attn = self.count_attention_in_physical_range(0, rec_start)?;
+        let rec_attn = self.count_attention_in_physical_range(rec_start, out_phys_start)?;
+
+        if virtual_idx < self.n_input_layers {
+            let offset = self.count_attention_in_physical_range(0, physical)?;
+            return Ok(Some(offset));
+        }
+
+        let recurrent_span = self.n_recurrent_layers.saturating_mul(self.n_loops);
+        let rec_virt_end = self.n_input_layers.saturating_add(recurrent_span);
+        if virtual_idx < rec_virt_end {
+            let rec_offset = self.count_attention_in_physical_range(rec_start, physical)?;
+            let slot = match self.kv_cache_mode {
+                DoryKvCacheMode::PerLoop => {
+                    let loop_idx =
+                        ((virtual_idx - self.n_input_layers) / self.n_recurrent_layers) as usize;
+                    in_attn
+                        .saturating_add(loop_idx.saturating_mul(rec_attn))
+                        .saturating_add(rec_offset)
+                }
+                DoryKvCacheMode::LastLoop => in_attn.saturating_add(rec_offset),
+            };
+            return Ok(Some(slot));
+        }
+
+        let rec_slots = match self.kv_cache_mode {
+            DoryKvCacheMode::PerLoop => rec_attn.saturating_mul(self.n_loops as usize),
+            DoryKvCacheMode::LastLoop => rec_attn,
+        };
+        let out_offset = self.count_attention_in_physical_range(out_phys_start, physical)?;
+        Ok(Some(
+            in_attn.saturating_add(rec_slots).saturating_add(out_offset),
+        ))
+    }
+
+    /// Builds the compact attention-only [`KvGeometry`] for a sequence capacity of `seq_capacity`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error`] if `attention_kv_layer_count() == 0`, dimensions are invalid, or buffer
+    /// sizing overflows `usize`.
+    pub fn kv_geometry(&self, seq_capacity: usize) -> Result<KvGeometry, K3Error> {
+        let num_layers = self.attention_kv_layer_count()?;
+        let sliding = (self.sliding_window > 0).then_some(self.sliding_window as usize);
+        KvGeometry::new(
+            num_layers,
+            self.num_kv_heads as usize,
+            self.head_dim as usize,
+            seq_capacity,
+            sliding,
+        )
     }
 
     /// Maps a virtual execution sub-layer index `virtual_idx` (`0..virtual_layer_count()`)
@@ -480,22 +899,25 @@ impl DoryRecipe {
     /// # Errors
     /// Returns [`K3Error::CapabilityMismatch`] if `physical_idx` is out of bounds or the pattern character is invalid.
     pub fn sublayer_kind(&self, physical_idx: u32) -> Result<DorySubLayerKind, K3Error> {
+        let n_physical = self.physical_layer_count();
+        if physical_idx >= n_physical {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!(
+                    "physical sub-layer index {physical_idx} out of bounds (physical_layer_count={n_physical})"
+                ),
+            });
+        }
         let ch = self
             .layer_pattern
-            .as_bytes()
-            .get(physical_idx as usize)
-            .map_or_else(
-                || {
-                    if physical_idx % 2 == 1 {
-                        '-'
-                    } else if physical_idx % 8 == 6 {
-                        '*'
-                    } else {
-                        'S'
-                    }
-                },
-                |&b| b as char,
-            );
+            .chars()
+            .nth(physical_idx as usize)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!(
+                    "dory.layer_pattern has no entry at physical sub-layer {physical_idx}"
+                ),
+            })?;
         DorySubLayerKind::from_pattern_char(ch)
     }
 
@@ -507,7 +929,7 @@ impl DoryRecipe {
     /// 4. Output Block (`n_input + n_recurrent .. n_physical`).
     ///
     /// # Errors
-    /// Returns [`K3Error`] if tensor bounds or sub-layer dimensions are invalid.
+    /// Returns [`K3Error`] if tensor bounds, KV cache capacity, or sub-layer dimensions are invalid.
     pub fn execute_dory_virtual_schedule(
         &self,
         token_id: u32,
@@ -515,16 +937,79 @@ impl DoryRecipe {
         kv_cache: &mut [f32],
         weights: &dyn ModelWeights,
     ) -> Result<Vec<f32>, K3Error> {
-        let embd = weights.tensor("token_embd.weight")?;
+        let num_kv_slots = self.attention_kv_layer_count()?;
+        let mut kv_view = if num_kv_slots > 0 {
+            let kv_dim = (self.num_kv_heads as usize)
+                .max(1)
+                .saturating_mul((self.head_dim as usize).max(2));
+            let slot_elems = num_kv_slots.saturating_mul(2).saturating_mul(kv_dim);
+            let seq_capacity = kv_cache.len().checked_div(slot_elems).unwrap_or(0);
+            if seq_capacity <= pos {
+                if weights.tensor_count() > 0 {
+                    return if seq_capacity == 0 {
+                        Err(K3Error::TensorBoundsError {
+                            tensor_name: "kv_cache".to_owned(),
+                            offset: 0,
+                            byte_len: slot_elems
+                                .saturating_mul(pos + 1)
+                                .saturating_mul(size_of::<f32>()),
+                            buffer_len: size_of_val(kv_cache),
+                            reason: format!(
+                                "kv_cache buffer length {} cannot hold compact Dory attention slot count {num_kv_slots} at pos {pos}",
+                                kv_cache.len()
+                            ),
+                        })
+                    } else {
+                        Err(K3Error::ContextLengthExceeded {
+                            requested_tokens: pos + 1,
+                            max_context_tokens: seq_capacity,
+                        })
+                    };
+                }
+                None
+            } else {
+                let geom = self.kv_geometry(seq_capacity)?;
+                Some(KvCacheView::new(kv_cache, geom)?)
+            }
+        } else {
+            None
+        };
+
+        self.execute_dory_schedule_with_kv(token_id, pos, kv_view.as_mut(), weights)
+    }
+
+    fn execute_dory_schedule_with_kv(
+        &self,
+        token_id: u32,
+        pos: usize,
+        mut kv_view: Option<&mut KvCacheView<'_>>,
+        weights: &dyn ModelWeights,
+    ) -> Result<Vec<f32>, K3Error> {
         let hidden_dim = (self.hidden_dim as usize).max(2);
-        let mut cur = extract_token_embedding(&embd, token_id, hidden_dim);
+        let mut cur = match weights.tensor("token_embd.weight") {
+            Ok(embd) => extract_token_embedding(&embd, token_id, hidden_dim)?,
+            Err(err) => {
+                if weights.tensor_count() == 0 {
+                    synthetic_unit_embedding(token_id, hidden_dim)
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         l2_normalize_in_place(&mut cur, DORY_L2_EPS);
 
         let mut virtual_idx = 0_u32;
 
         // 1. Input Block (0 .. n_input_layers)
         for p in 0..self.n_input_layers {
-            self.execute_physical_sublayer(&mut cur, p, virtual_idx, pos, kv_cache, weights)?;
+            self.execute_physical_sublayer_kv(
+                &mut cur,
+                p,
+                virtual_idx,
+                pos,
+                kv_view.as_deref_mut(),
+                weights,
+            )?;
             virtual_idx += 1;
         }
 
@@ -541,7 +1026,14 @@ impl DoryRecipe {
 
             for offset in 0..self.n_recurrent_layers {
                 let p = self.n_input_layers + offset;
-                self.execute_physical_sublayer(&mut cur, p, virtual_idx, pos, kv_cache, weights)?;
+                self.execute_physical_sublayer_kv(
+                    &mut cur,
+                    p,
+                    virtual_idx,
+                    pos,
+                    kv_view.as_deref_mut(),
+                    weights,
+                )?;
                 virtual_idx += 1;
             }
 
@@ -553,24 +1045,32 @@ impl DoryRecipe {
         let out_start = self.n_input_layers + self.n_recurrent_layers;
         let n_physical = self.physical_layer_count();
         for p in out_start..n_physical {
-            self.execute_physical_sublayer(&mut cur, p, virtual_idx, pos, kv_cache, weights)?;
+            self.execute_physical_sublayer_kv(
+                &mut cur,
+                p,
+                virtual_idx,
+                pos,
+                kv_view.as_deref_mut(),
+                weights,
+            )?;
             virtual_idx += 1;
         }
 
         Ok(cur)
     }
 
-    fn execute_physical_sublayer(
+    fn execute_physical_sublayer_kv(
         &self,
         cur: &mut [f32],
         physical_idx: u32,
         virtual_idx: u32,
         pos: usize,
-        kv_cache: &mut [f32],
+        kv_view: Option<&mut KvCacheView<'_>>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         let kind = self.sublayer_kind(physical_idx)?;
         let hidden_dim = cur.len();
+
         let alpha_name = format!("blk.{physical_idx}.residual_alpha.weight");
         let alpha = if weights.contains_tensor(&alpha_name) {
             extract_scale_vector_f32(weights, &alpha_name, hidden_dim)?
@@ -580,27 +1080,47 @@ impl DoryRecipe {
 
         match kind {
             DorySubLayerKind::SlidingAttention | DorySubLayerKind::FullAttention => {
-                let q_name = format!("blk.{physical_idx}.attn_q.weight");
-                if !weights.contains_tensor(&q_name) {
-                    return Ok(());
+                if weights.tensor_count() == 0 {
+                    let q_name = format!("blk.{physical_idx}.attn_q.weight");
+                    if !weights.contains_tensor(&q_name) {
+                        return Ok(());
+                    }
                 }
-                let cache_layer = self.virtual_to_cache_layer(virtual_idx)? as usize;
-                let sub_out = run_dory_attention_sublayer(
+                let kv_slot = self.virtual_to_attention_kv_slot(virtual_idx)?.ok_or_else(|| {
+                    K3Error::CapabilityMismatch {
+                        architecture: "dory".to_owned(),
+                        reason: format!(
+                            "attention sub-layer virtual={virtual_idx} physical={physical_idx} has no KV slot"
+                        ),
+                    }
+                })?;
+                let kv = kv_view.ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "kv_cache".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: format!(
+                        "missing KvCacheView for attention sub-layer virtual={virtual_idx} slot={kv_slot}"
+                    ),
+                })?;
+                let sub_out = run_dory_attention_with_kv_view(
                     self,
                     cur,
                     pos,
                     kind,
                     physical_idx,
-                    cache_layer,
-                    kv_cache,
+                    kv_slot,
+                    kv,
                     weights,
                 )?;
                 apply_ngpt_residual_update(cur, &sub_out, &alpha)?;
             }
             DorySubLayerKind::Mlp => {
-                let gate_name = format!("blk.{physical_idx}.ffn_gate.weight");
-                if !weights.contains_tensor(&gate_name) {
-                    return Ok(());
+                if weights.tensor_count() == 0 {
+                    let gate_name = format!("blk.{physical_idx}.ffn_gate.weight");
+                    if !weights.contains_tensor(&gate_name) {
+                        return Ok(());
+                    }
                 }
                 let sub_out = run_dory_mlp_sublayer(self, cur, physical_idx, weights)?;
                 apply_ngpt_residual_update(cur, &sub_out, &alpha)?;
@@ -662,20 +1182,18 @@ pub fn apply_ngpt_residual_update(
     }
 }
 
-/// Executes a disaggregated Dory nGPT attention sub-layer (`'S'` sliding-window or `'*'` full-context):
+/// Executes a disaggregated Dory nGPT attention sub-layer (`'S'` sliding-window or `'*'`/`'g'` full-context):
 /// - Q/K/V + `attn_gate` linear projections,
-/// - Dual-theta `NeoX` `RoPE` (`theta_1 = 10M` for `'*'`, `theta_2 = 10K` for `'S'`),
+/// - Dual-theta `NeoX` `RoPE` (`theta_1 = 10M` for `'*'`/`'g'`, `theta_2 = 10K` for `'S'`),
 /// - Per-head L2 normalization of Q and K with `sqk = (attn_qk_scale * sqrt(head_dim) / init_std)^2`,
-/// - Causal GQA attention (with `sliding_window` on `'S'`),
+/// - Compact `KvCacheView` causal GQA attention (with `sliding_window` on `'S'`),
 /// - Sigmoid attention gating `sigmoid(gate * (attn_gate_scale * sqrt(gate_init) / init_std)^2)`,
 /// - L2 normalization and `attn_output` projection.
 ///
 /// # Errors
-/// Returns [`K3Error`] if tensor shapes or quantization formats are invalid.
+/// Returns [`K3Error`] if tensor shapes, KV cache bounds, or quantization formats are invalid.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
     reason = "complete nGPT attention sub-layer operator with dual-theta NeoX RoPE, sqk, SWA, and sigmoid gate"
 )]
 pub fn run_dory_attention_sublayer(
@@ -688,6 +1206,67 @@ pub fn run_dory_attention_sublayer(
     kv_cache: &mut [f32],
     weights: &dyn ModelWeights,
 ) -> Result<Vec<f32>, K3Error> {
+    let num_kv_slots = recipe.attention_kv_layer_count()?;
+    if num_kv_slots == 0 || cache_layer >= num_kv_slots {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: format!("kv_cache.layer.{cache_layer}"),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: size_of_val(kv_cache),
+            reason: format!(
+                "attention KV slot {cache_layer} out of bounds for compact attention slot count {num_kv_slots}"
+            ),
+        });
+    }
+    let num_kv_heads = (recipe.num_kv_heads as usize).max(1);
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let kv_dim = num_kv_heads.saturating_mul(head_dim);
+    let slot_elems = num_kv_slots.saturating_mul(2).saturating_mul(kv_dim);
+    let seq_capacity = kv_cache.len().checked_div(slot_elems).unwrap_or(0);
+    if seq_capacity == 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: slot_elems
+                .saturating_mul(pos + 1)
+                .saturating_mul(size_of::<f32>()),
+            buffer_len: size_of_val(kv_cache),
+            reason: format!(
+                "kv_cache length {} smaller than single-token compact attention requirement {slot_elems}",
+                kv_cache.len()
+            ),
+        });
+    }
+    let geom = recipe.kv_geometry(seq_capacity)?;
+    let mut kv_view = KvCacheView::new(kv_cache, geom)?;
+    run_dory_attention_with_kv_view(
+        recipe,
+        cur,
+        pos,
+        kind,
+        physical_idx,
+        cache_layer,
+        &mut kv_view,
+        weights,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    reason = "complete nGPT attention sub-layer operator backed by bounds-checked KvCacheView"
+)]
+fn run_dory_attention_with_kv_view(
+    recipe: &DoryRecipe,
+    cur: &[f32],
+    pos: usize,
+    kind: DorySubLayerKind,
+    physical_idx: u32,
+    kv_slot: usize,
+    kv_view: &mut KvCacheView<'_>,
+    weights: &dyn ModelWeights,
+) -> Result<Vec<f32>, K3Error> {
     let hidden_dim = cur.len();
     let num_heads = (recipe.num_heads as usize).max(1);
     let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
@@ -696,7 +1275,7 @@ pub fn run_dory_attention_sublayer(
     let kv_dim = num_kv_heads * head_dim;
 
     let q_view = weights.tensor(&format!("blk.{physical_idx}.attn_q.weight"))?;
-    let k_view = weights.tensor(&format!("blk.{physical_idx}.attn_k.weight"))?;
+    let key_weight = weights.tensor(&format!("blk.{physical_idx}.attn_k.weight"))?;
     let v_view = weights.tensor(&format!("blk.{physical_idx}.attn_v.weight"))?;
     let gate_view = weights.tensor(&format!("blk.{physical_idx}.attn_gate.weight"))?;
     let out_view = weights.tensor(&format!("blk.{physical_idx}.attn_output.weight"))?;
@@ -717,11 +1296,11 @@ pub fn run_dory_attention_sublayer(
     };
 
     let mut q = project_linear(&q_view, cur, q_dim)?;
-    let mut k = project_linear(&k_view, cur, kv_dim)?;
+    let mut k = project_linear(&key_weight, cur, kv_dim)?;
     let v = project_linear(&v_view, cur, kv_dim)?;
     let gate = project_linear(&gate_view, cur, q_dim)?;
 
-    // Dual-theta NeoX RoPE (profile 1 '*' -> rope_theta_full = 10M, profile 2 'S' -> rope_theta_swa = 10K)
+    // Dual-theta NeoX RoPE (profile 1 '*'/g -> rope_theta_full = 10M, profile 2 'S' -> rope_theta_swa = 10K)
     let theta = if kind == DorySubLayerKind::FullAttention {
         recipe.rope_theta_full
     } else {
@@ -752,77 +1331,61 @@ pub fn run_dory_attention_sublayer(
         }
     }
 
-    // Store K and V in kv_cache if capacity permits, then compute causal GQA attention (with SWA on 'S')
+    // Write K and V into compact attention-only KvCacheView (fails closed on overflow/OOB)
+    {
+        let (key_dst, val_dst) = kv_view.write_pos_range(kv_slot, pos)?;
+        key_dst.copy_from_slice(&k);
+        val_dst.copy_from_slice(&v);
+    }
+
+    let (k_plane, v_plane) = kv_view.layer_kv(kv_slot)?;
+    let valid_len = pos + 1;
+    let window_start = if kind == DorySubLayerKind::SlidingAttention {
+        let swa = (recipe.sliding_window as usize).max(1);
+        valid_len.saturating_sub(swa)
+    } else {
+        0
+    };
+
     let attn_scale = (head_dim as f32).sqrt();
     let mut attn_heads_out = vec![0.0_f32; q_dim];
 
-    let total_virtual_layers = (recipe.virtual_layer_count() as usize).max(1);
-    let layer_stride = kv_cache.len() / total_virtual_layers;
-    let token_stride = 2 * kv_dim;
-    let max_tokens_in_layer = layer_stride.checked_div(token_stride).unwrap_or(0);
+    for h in 0..num_heads {
+        let kh = h / kv_group_size;
+        let q_head = &q[h * head_dim..(h + 1) * head_dim];
+        let mut scores = Vec::with_capacity(valid_len - window_start);
+        let mut max_score = f32::NEG_INFINITY;
 
-    if max_tokens_in_layer > 0 && cache_layer < total_virtual_layers {
-        let slot_pos = pos % max_tokens_in_layer;
-        let layer_base = cache_layer * layer_stride;
-        let k_off = layer_base + slot_pos * token_stride;
-        let v_off = k_off + kv_dim;
-        if v_off + kv_dim <= kv_cache.len() {
-            kv_cache[k_off..k_off + kv_dim].copy_from_slice(&k);
-            kv_cache[v_off..v_off + kv_dim].copy_from_slice(&v);
+        for t in window_start..valid_len {
+            let t_k_off = t * kv_dim + kh * head_dim;
+            let k_head = &k_plane[t_k_off..t_k_off + head_dim];
+            let dot = quant::dot_product_f32(q_head, k_head);
+            let sc = dot * attn_scale;
+            if sc > max_score {
+                max_score = sc;
+            }
+            scores.push(sc);
         }
 
-        let valid_len = (pos + 1).min(max_tokens_in_layer);
-        let window_start = if kind == DorySubLayerKind::SlidingAttention {
-            let swa = (recipe.sliding_window as usize).max(1);
-            valid_len.saturating_sub(swa)
+        let mut sum_exp = 0.0_f32;
+        for sc in &mut scores {
+            *sc = (*sc - max_score).exp();
+            sum_exp += *sc;
+        }
+        let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
+            1.0 / sum_exp
         } else {
-            0
+            0.0
         };
 
-        for h in 0..num_heads {
-            let kh = h / kv_group_size;
-            let q_head = &q[h * head_dim..(h + 1) * head_dim];
-            let mut scores = Vec::with_capacity(valid_len - window_start);
-            let mut max_score = f32::NEG_INFINITY;
-
-            for t in window_start..valid_len {
-                let t_k_off = layer_base + t * token_stride + kh * head_dim;
-                let k_head = &kv_cache[t_k_off..t_k_off + head_dim];
-                let dot: f32 = q_head
-                    .iter()
-                    .zip(k_head.iter())
-                    .map(|(&qv, &kv)| qv * kv)
-                    .sum();
-                let sc = dot * attn_scale;
-                if sc > max_score {
-                    max_score = sc;
-                }
-                scores.push(sc);
+        let out_head = &mut attn_heads_out[h * head_dim..(h + 1) * head_dim];
+        for (idx, t) in (window_start..valid_len).enumerate() {
+            let prob = scores[idx] * inv_sum;
+            let t_v_off = t * kv_dim + kh * head_dim;
+            let v_head = &v_plane[t_v_off..t_v_off + head_dim];
+            for (o, &vv) in out_head.iter_mut().zip(v_head.iter()) {
+                *o += prob * vv;
             }
-
-            let mut sum_exp = 0.0_f32;
-            for sc in &mut scores {
-                *sc = (*sc - max_score).exp();
-                sum_exp += *sc;
-            }
-            let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
-
-            let out_head = &mut attn_heads_out[h * head_dim..(h + 1) * head_dim];
-            for (idx, t) in (window_start..valid_len).enumerate() {
-                let prob = scores[idx] * inv_sum;
-                let t_v_off = layer_base + t * token_stride + kv_dim + kh * head_dim;
-                let v_head = &kv_cache[t_v_off..t_v_off + head_dim];
-                for (o, &vv) in out_head.iter_mut().zip(v_head.iter()) {
-                    *o += prob * vv;
-                }
-            }
-        }
-    } else {
-        // Fallback single-token self-attention when kv_cache slice is smaller than full layer stride
-        for h in 0..num_heads {
-            let kh = h / kv_group_size;
-            let v_head = &v[kh * head_dim..(kh + 1) * head_dim];
-            attn_heads_out[h * head_dim..(h + 1) * head_dim].copy_from_slice(v_head);
         }
     }
 
@@ -926,63 +1489,8 @@ pub fn apply_neox_rope(vec: &mut [f32], num_heads: usize, head_dim: usize, pos: 
     }
 }
 
-fn extract_token_embedding(embd: &TensorView<'_>, token_id: u32, hidden_dim: usize) -> Vec<f32> {
-    let raw = embd.as_bytes();
+fn synthetic_unit_embedding(token_id: u32, hidden_dim: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; hidden_dim];
-    match embd.quant() {
-        QuantType::F32 => {
-            let row_bytes = hidden_dim * 4;
-            let start = (token_id as usize)
-                .checked_mul(row_bytes)
-                .filter(|&s| s + row_bytes <= raw.len())
-                .unwrap_or(0);
-            if start + row_bytes <= raw.len() {
-                for (i, slot) in out.iter_mut().enumerate() {
-                    let off = start + i * 4;
-                    *slot =
-                        f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-                }
-                if out.iter().any(|&v| v != 0.0) {
-                    return out;
-                }
-            }
-        }
-        QuantType::F16 => {
-            let row_bytes = hidden_dim * 2;
-            let start = (token_id as usize)
-                .checked_mul(row_bytes)
-                .filter(|&s| s + row_bytes <= raw.len())
-                .unwrap_or(0);
-            if start + row_bytes <= raw.len() {
-                for (i, slot) in out.iter_mut().enumerate() {
-                    let off = start + i * 2;
-                    *slot = f16_bits_to_f32_finite(u16::from_le_bytes([raw[off], raw[off + 1]]));
-                }
-                if out.iter().any(|&v| v != 0.0) {
-                    return out;
-                }
-            }
-        }
-        QuantType::BF16 => {
-            let row_bytes = hidden_dim * 2;
-            let start = (token_id as usize)
-                .checked_mul(row_bytes)
-                .filter(|&s| s + row_bytes <= raw.len())
-                .unwrap_or(0);
-            if start + row_bytes <= raw.len() {
-                for (i, slot) in out.iter_mut().enumerate() {
-                    let off = start + i * 2;
-                    *slot = bf16_to_f32_finite(u16::from_le_bytes([raw[off], raw[off + 1]]));
-                }
-                if out.iter().any(|&v| v != 0.0) {
-                    return out;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // Deterministic non-zero unit hypersphere fallback seed when synthetic embedding is zero-filled
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -994,204 +1502,76 @@ fn extract_token_embedding(embd: &TensorView<'_>, token_id: u32, hidden_dim: usi
     out
 }
 
-/// Projects `input` through a 2D weight tensor (`F32`, `F16`, `BF16`, `Q4_0`, `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`).
+fn extract_token_embedding(
+    embd: &TensorView<'_>,
+    token_id: u32,
+    hidden_dim: usize,
+) -> Result<Vec<f32>, K3Error> {
+    let mut out = vec![0.0_f32; hidden_dim];
+    quant::dequantize_row_to_f32(embd, token_id as usize, hidden_dim, &mut out)?;
+    Ok(out)
+}
+
+/// Projects `input` through a 2D weight tensor (`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`, `Q8_0`,
+/// `Q4_K_M`, `Q5_K`, `Q6_K`) without silent synthetic fallbacks.
 ///
 /// # Errors
 /// Returns [`K3Error`] if `weight` is quantized with an unsupported format or bounds mismatch.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatches dense and quantized matrix-vector formats"
-)]
 pub fn project_linear(
     weight: &TensorView<'_>,
     input: &[f32],
     out_dim: usize,
 ) -> Result<Vec<f32>, K3Error> {
     let mut output = vec![0.0_f32; out_dim];
-    let cols = input.len();
-    let raw = weight.as_bytes();
+    quant::project_matvec(&mut output, weight, input)?;
+    Ok(output)
+}
 
-    match weight.quant() {
-        QuantType::F32 => {
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * cols * 4;
-                let mut sum = 0.0_f32;
-                for (c, &x) in input.iter().enumerate() {
-                    let off = row_off + c * 4;
-                    if off + 4 <= raw.len() {
-                        let w = f32::from_le_bytes([
-                            raw[off],
-                            raw[off + 1],
-                            raw[off + 2],
-                            raw[off + 3],
-                        ]);
-                        sum += w * x;
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        QuantType::F16 => {
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * cols * 2;
-                let mut sum = 0.0_f32;
-                for (c, &x) in input.iter().enumerate() {
-                    let off = row_off + c * 2;
-                    if off + 2 <= raw.len() {
-                        let w =
-                            f16_bits_to_f32_finite(u16::from_le_bytes([raw[off], raw[off + 1]]));
-                        sum += w * x;
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        QuantType::BF16 => {
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * cols * 2;
-                let mut sum = 0.0_f32;
-                for (c, &x) in input.iter().enumerate() {
-                    let off = row_off + c * 2;
-                    if off + 2 <= raw.len() {
-                        let w = bf16_to_f32_finite(u16::from_le_bytes([raw[off], raw[off + 1]]));
-                        sum += w * x;
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        #[cfg(feature = "with-kernels")]
-        QuantType::Q5_K => {
-            if weight.num_elements() == out_dim * cols && cols % 256 == 0 {
-                vec_dot_q5_k(&mut output, weight, input)?;
-                return Ok(output);
-            }
-            let blocks_per_row = cols / 256;
-            let bytes_per_row = blocks_per_row * 176;
-            let mut deq = [0.0_f32; 256];
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * bytes_per_row;
-                let mut sum = 0.0_f32;
-                for b in 0..blocks_per_row {
-                    let off = row_off + b * 176;
-                    if off + 176 <= raw.len() {
-                        let mut blk = [0_u8; 176];
-                        blk.copy_from_slice(&raw[off..off + 176]);
-                        dequantize_q5_k_block(&blk, &mut deq);
-                        let x_slice = &input[b * 256..(b + 1) * 256];
-                        for (&w, &x) in deq.iter().zip(x_slice.iter()) {
-                            sum += w * x;
-                        }
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        #[cfg(feature = "with-kernels")]
-        QuantType::Q4_K_M => {
-            if weight.num_elements() == out_dim * cols && cols % 256 == 0 {
-                BaselineKernel::new().vec_dot_q4_k_m(&mut output, weight, input)?;
-            }
-            Ok(output)
-        }
-        #[cfg(feature = "with-kernels")]
-        QuantType::Q6_K => {
-            if weight.num_elements() == out_dim * cols && cols % 256 == 0 {
-                BaselineKernel::new().vec_dot_q6_k(&mut output, weight, input)?;
-                return Ok(output);
-            }
-            let blocks_per_row = cols / 256;
-            let bytes_per_row = blocks_per_row * 210;
-            let mut deq = [0.0_f32; 256];
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * bytes_per_row;
-                let mut sum = 0.0_f32;
-                for b in 0..blocks_per_row {
-                    let off = row_off + b * 210;
-                    if off + 210 <= raw.len() {
-                        let mut blk = [0_u8; 210];
-                        blk.copy_from_slice(&raw[off..off + 210]);
-                        dequantize_q6_k_block(&blk, &mut deq);
-                        let x_slice = &input[b * 256..(b + 1) * 256];
-                        for (&w, &x) in deq.iter().zip(x_slice.iter()) {
-                            sum += w * x;
-                        }
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        #[cfg(feature = "with-kernels")]
-        QuantType::Q8_0 => {
-            if weight.num_elements() == out_dim * cols && cols % 32 == 0 {
-                BaselineKernel::new().vec_dot_q8_0(&mut output, weight, input)?;
-                return Ok(output);
-            }
-            let blocks_per_row = cols / 32;
-            let bytes_per_row = blocks_per_row * 34;
-            let mut deq = [0.0_f32; 32];
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * bytes_per_row;
-                let mut sum = 0.0_f32;
-                for b in 0..blocks_per_row {
-                    let off = row_off + b * 34;
-                    if off + 34 <= raw.len() {
-                        let mut blk = [0_u8; 34];
-                        blk.copy_from_slice(&raw[off..off + 34]);
-                        dequantize_q8_0_block(&blk, &mut deq);
-                        let x_slice = &input[b * 32..(b + 1) * 32];
-                        for (&w, &x) in deq.iter().zip(x_slice.iter()) {
-                            sum += w * x;
-                        }
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        QuantType::Q4_0 => {
-            let blocks_per_row = cols / 32;
-            let bytes_per_row = blocks_per_row * 18;
-            for (r, slot) in output.iter_mut().enumerate() {
-                let row_off = r * bytes_per_row;
-                let mut sum = 0.0_f32;
-                for b in 0..blocks_per_row {
-                    let off = row_off + b * 18;
-                    if off + 18 <= raw.len() {
-                        let d =
-                            f16_bits_to_f32_finite(u16::from_le_bytes([raw[off], raw[off + 1]]));
-                        let x_slice = &input[b * 32..(b + 1) * 32];
-                        for i in 0..16 {
-                            let byte = raw[off + 2 + i];
-                            #[expect(
-                                clippy::cast_possible_wrap,
-                                reason = "4-bit nibble offset by -8"
-                            )]
-                            let q0 = (byte & 0x0F) as i8 - 8;
-                            #[expect(
-                                clippy::cast_possible_wrap,
-                                reason = "4-bit nibble offset by -8"
-                            )]
-                            let q1 = ((byte >> 4) & 0x0F) as i8 - 8;
-                            sum += d * f32::from(q0) * x_slice[i];
-                            sum += d * f32::from(q1) * x_slice[i + 16];
-                        }
-                    }
-                }
-                *slot = sum;
-            }
-            Ok(output)
-        }
-        other => Err(K3Error::CapabilityMismatch {
-            architecture: "dory".to_owned(),
-            reason: format!("unsupported quantization format {other} in Dory linear projection"),
-        }),
+fn validate_1d_scale_if_present(
+    weights: &dyn ModelWeights,
+    name: &str,
+    expected_len: usize,
+) -> Result<(), K3Error> {
+    if !weights.contains_tensor(name) {
+        return Ok(());
     }
+    let view = weights.tensor(name)?;
+    if view.num_elements() != expected_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: view.offset(),
+            byte_len: view.byte_len(),
+            buffer_len: view.as_bytes().len(),
+            reason: format!(
+                "scale vector '{name}' expected {expected_len} elements, got {}",
+                view.num_elements()
+            ),
+        });
+    }
+    let elem_bytes = match view.quant() {
+        QuantType::F32 => 4,
+        QuantType::F16 | QuantType::BF16 => 2,
+        other => {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!("1D scale vector '{name}' must be F32, F16, or BF16, got {other}"),
+            });
+        }
+    };
+    let required = expected_len.saturating_mul(elem_bytes);
+    if view.as_bytes().len() < required {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: view.offset(),
+            byte_len: required,
+            buffer_len: view.as_bytes().len(),
+            reason: format!(
+                "scale vector '{name}' byte length {} smaller than required {required}",
+                view.as_bytes().len()
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl ArchRecipe for DoryRecipe {
@@ -1207,6 +1587,10 @@ impl ArchRecipe for DoryRecipe {
         &["native", "ime_tile_8x16"]
     }
 
+    fn requires_kv_cache(&self) -> bool {
+        self.attention_kv_layer_count().unwrap_or(1) > 0
+    }
+
     fn supports_quant(&self, quant: QuantType) -> bool {
         matches!(
             quant,
@@ -1214,11 +1598,71 @@ impl ArchRecipe for DoryRecipe {
                 | QuantType::F16
                 | QuantType::BF16
                 | QuantType::Q4_0
+                | QuantType::Q5_0
                 | QuantType::Q8_0
                 | QuantType::Q4_K_M
                 | QuantType::Q5_K
                 | QuantType::Q6_K
         )
+    }
+
+    fn validate_model(
+        &self,
+        metadata: &ModelMetadata,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        for desc in metadata.tensors() {
+            if !self.supports_quant(desc.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(
+                    metadata.architecture(),
+                    desc.name(),
+                    desc.quant(),
+                ));
+            }
+            if weights.tensor_count() > 0
+                && let Ok(view) = weights.tensor(desc.name())
+                && !self.supports_quant(view.quant())
+            {
+                return Err(K3Error::unsupported_tensor_quant(
+                    metadata.architecture(),
+                    view.name(),
+                    view.quant(),
+                ));
+            }
+        }
+
+        let effective = if metadata.dory().is_some()
+            || (metadata.embedding_dim() > 0 && metadata.layer_count() > 0)
+        {
+            Cow::Owned(Self::from_metadata(metadata)?)
+        } else {
+            Cow::Borrowed(self)
+        };
+        effective.validate_hyperparams()?;
+
+        if weights.tensor_count() == 0 {
+            return Ok(());
+        }
+
+        let hidden_dim = (effective.hidden_dim as usize).max(2);
+        let ffn_dim = (effective.ffn_dim as usize).max(1);
+        let num_heads = (effective.num_heads as usize).max(1);
+        let num_kv_heads = (effective.num_kv_heads as usize).max(1).min(num_heads);
+        let head_dim = (effective.head_dim as usize).max(2);
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        validate_global_weights(&effective, weights, hidden_dim)?;
+
+        let n_physical = effective.physical_layer_count();
+        for p in 0..n_physical {
+            let kind = effective.sublayer_kind(p)?;
+            validate_physical_layer_weights(
+                &effective, p, kind, weights, hidden_dim, q_dim, kv_dim, ffn_dim,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn prefill_step(
@@ -1234,18 +1678,46 @@ impl ArchRecipe for DoryRecipe {
             });
         }
 
+        let n_ctx = ctx.n_ctx();
         let start_pos = ctx.position();
+        let end_pos =
+            start_pos
+                .checked_add(tokens.len())
+                .ok_or(K3Error::ContextLengthExceeded {
+                    requested_tokens: usize::MAX,
+                    max_context_tokens: n_ctx,
+                })?;
+        if end_pos > n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: n_ctx,
+            });
+        }
+
+        let num_kv_slots = self.attention_kv_layer_count()?;
+        let (logits_buf, kv_buf) = ctx.buffers_mut();
+        let mut kv_view = if num_kv_slots > 0 {
+            let geom = self.kv_geometry(n_ctx)?;
+            if weights.tensor_count() > 0 {
+                Some(KvCacheView::new(kv_buf, geom)?)
+            } else {
+                KvCacheView::new(kv_buf, geom).ok()
+            }
+        } else {
+            None
+        };
+
         let mut last_hidden = Vec::new();
         for (idx, &token_id) in tokens.iter().enumerate() {
-            last_hidden = self.execute_dory_virtual_schedule(
+            last_hidden = self.execute_dory_schedule_with_kv(
                 token_id,
                 start_pos + idx,
-                ctx.kv_cache_mut(),
+                kv_view.as_mut(),
                 weights,
             )?;
         }
 
-        populate_dory_logits(self, &last_hidden, ctx.logits_mut(), weights)?;
+        populate_dory_logits(self, &last_hidden, logits_buf, weights)?;
         ctx.advance_position(tokens.len())?;
         Ok(())
     }
@@ -1261,40 +1733,231 @@ impl ArchRecipe for DoryRecipe {
                 architecture: "dory".to_owned(),
                 reason: "Dory decode_step requires a staged decode_token".to_owned(),
             })?;
+        let n_ctx = ctx.n_ctx();
         let pos = ctx.position();
+        if pos >= n_ctx {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: pos + 1,
+                max_context_tokens: n_ctx,
+            });
+        }
+
+        let num_kv_slots = self.attention_kv_layer_count()?;
+        let (logits_buf, kv_buf) = ctx.buffers_mut();
+        let mut kv_view = if num_kv_slots > 0 {
+            let geom = self.kv_geometry(n_ctx)?;
+            if weights.tensor_count() > 0 {
+                Some(KvCacheView::new(kv_buf, geom)?)
+            } else {
+                KvCacheView::new(kv_buf, geom).ok()
+            }
+        } else {
+            None
+        };
+
         let hidden =
-            self.execute_dory_virtual_schedule(token_id, pos, ctx.kv_cache_mut(), weights)?;
-        populate_dory_logits(self, &hidden, ctx.logits_mut(), weights)?;
+            self.execute_dory_schedule_with_kv(token_id, pos, kv_view.as_mut(), weights)?;
+        populate_dory_logits(self, &hidden, logits_buf, weights)?;
         ctx.advance_position(1)?;
         Ok(())
     }
 }
 
+fn validate_vocab_matrix_rows(
+    recipe: &DoryRecipe,
+    weights: &dyn ModelWeights,
+    name: &str,
+    hidden_dim: usize,
+) -> Result<usize, K3Error> {
+    let view = weights.tensor(name)?;
+    if !recipe.supports_quant(view.quant()) {
+        return Err(K3Error::unsupported_tensor_quant(
+            "dory",
+            view.name(),
+            view.quant(),
+        ));
+    }
+    let (rows, _) = quant::resolve_2d_dims(&view, hidden_dim)?;
+    Ok(rows)
+}
+
+fn validate_global_weights(
+    recipe: &DoryRecipe,
+    weights: &dyn ModelWeights,
+    hidden_dim: usize,
+) -> Result<(), K3Error> {
+    let embd_vocab_rows =
+        validate_vocab_matrix_rows(recipe, weights, "token_embd.weight", hidden_dim)?;
+    let lm_vocab_rows = if weights.contains_tensor("output.weight") {
+        validate_vocab_matrix_rows(recipe, weights, "output.weight", hidden_dim)?
+    } else {
+        embd_vocab_rows
+    };
+    validate_1d_scale_if_present(weights, "output_scale.weight", lm_vocab_rows)
+}
+
+fn validate_layer_matrix(
+    recipe: &DoryRecipe,
+    weights: &dyn ModelWeights,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<(), K3Error> {
+    let view = weights.tensor(name)?;
+    if !recipe.supports_quant(view.quant()) {
+        return Err(K3Error::unsupported_tensor_quant(
+            "dory",
+            name,
+            view.quant(),
+        ));
+    }
+    quant::validate_2d_dims(&view, rows, cols)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-layer dimension bounds check across attention and MLP projections"
+)]
+fn validate_physical_layer_weights(
+    recipe: &DoryRecipe,
+    phys_idx: u32,
+    kind: DorySubLayerKind,
+    weights: &dyn ModelWeights,
+    hidden_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    ffn_dim: usize,
+) -> Result<(), K3Error> {
+    validate_1d_scale_if_present(
+        weights,
+        &format!("blk.{phys_idx}.residual_alpha.weight"),
+        hidden_dim,
+    )?;
+
+    match kind {
+        DorySubLayerKind::SlidingAttention | DorySubLayerKind::FullAttention => {
+            for (suffix, rows, cols) in [
+                ("attn_q.weight", q_dim, hidden_dim),
+                ("attn_k.weight", kv_dim, hidden_dim),
+                ("attn_v.weight", kv_dim, hidden_dim),
+                ("attn_gate.weight", q_dim, hidden_dim),
+                ("attn_output.weight", hidden_dim, q_dim),
+            ] {
+                validate_layer_matrix(
+                    recipe,
+                    weights,
+                    &format!("blk.{phys_idx}.{suffix}"),
+                    rows,
+                    cols,
+                )?;
+            }
+            validate_1d_scale_if_present(
+                weights,
+                &format!("blk.{phys_idx}.attn_qk_scale.weight"),
+                q_dim,
+            )?;
+            validate_1d_scale_if_present(
+                weights,
+                &format!("blk.{phys_idx}.attn_gate_scale.weight"),
+                q_dim,
+            )?;
+        }
+        DorySubLayerKind::Mlp => {
+            for (suffix, rows, cols) in [
+                ("ffn_gate.weight", ffn_dim, hidden_dim),
+                ("ffn_up.weight", ffn_dim, hidden_dim),
+                ("ffn_down.weight", hidden_dim, ffn_dim),
+            ] {
+                validate_layer_matrix(
+                    recipe,
+                    weights,
+                    &format!("blk.{phys_idx}.{suffix}"),
+                    rows,
+                    cols,
+                )?;
+            }
+            validate_1d_scale_if_present(
+                weights,
+                &format!("blk.{phys_idx}.ffn_gate_scale.weight"),
+                ffn_dim,
+            )?;
+            validate_1d_scale_if_present(
+                weights,
+                &format!("blk.{phys_idx}.ffn_up_scale.weight"),
+                ffn_dim,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "hidden dimension fits cleanly in f32 scalar"
+)]
 fn populate_dory_logits(
     recipe: &DoryRecipe,
     hidden: &[f32],
     logits: &mut [f32],
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
-    if logits.is_empty() || hidden.is_empty() {
-        return Ok(());
+    if hidden.is_empty() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: "Dory final hidden state must not be empty".to_owned(),
+        });
     }
-    let vocab_len = logits.len();
-    if weights.contains_tensor("output.weight") {
-        let out_w = weights.tensor("output.weight")?;
-        let projected = project_linear(&out_w, hidden, vocab_len)?;
-        logits.copy_from_slice(&projected);
+    if logits.is_empty() {
+        if weights.tensor_count() == 0 {
+            return Ok(());
+        }
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "logits".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: 0,
+            reason: "logits output buffer must not be empty".to_owned(),
+        });
+    }
+
+    let lm_head = if weights.contains_tensor("output.weight") {
+        Some(weights.tensor("output.weight")?)
+    } else if weights.contains_tensor("token_embd.weight") {
+        // Tied LM head fallback when output.weight is omitted in GGUF.
+        Some(weights.tensor("token_embd.weight")?)
+    } else if weights.tensor_count() == 0 {
+        None
     } else {
+        return Err(weights.tensor("output.weight").unwrap_err());
+    };
+
+    let Some(lm_w) = lm_head else {
         for (i, slot) in logits.iter_mut().enumerate() {
             *slot = hidden[i % hidden.len()];
         }
+        return Ok(());
+    };
+
+    let (vocab_rows, _) = quant::resolve_2d_dims(&lm_w, hidden.len())?;
+    let proj_len = logits.len().min(vocab_rows);
+    quant::project_matvec_prefix(&mut logits[..proj_len], &lm_w, hidden)?;
+    if proj_len < logits.len() {
+        logits[proj_len..].fill(0.0);
     }
 
     let init_std = recipe.init_std.max(1e-6);
     if weights.contains_tensor("output_scale.weight") {
-        let scale = extract_scale_vector_f32(weights, "output_scale.weight", vocab_len)?;
-        for (slot, &s) in logits.iter_mut().zip(scale.iter()) {
-            *slot *= s / init_std;
+        let scale = extract_scale_vector_f32(weights, "output_scale.weight", vocab_rows)?;
+        let extra = recipe.logit_scale.unwrap_or(1.0);
+        for (slot, &s) in logits[..proj_len].iter_mut().zip(scale[..proj_len].iter()) {
+            *slot *= (s / init_std) * extra;
+        }
+    } else {
+        let scale = recipe
+            .logit_scale
+            .unwrap_or_else(|| 1.0_f32 / (hidden.len() as f32).sqrt());
+        for slot in &mut logits[..proj_len] {
+            *slot *= scale;
         }
     }
     Ok(())
