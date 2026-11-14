@@ -5,15 +5,18 @@
 //! `Q8_0`, `Q4_K_M`, `Q5_K`, and `Q6_K` when built with `--no-default-features`.
 
 use jero_core::{K3Error, QuantType, TensorView};
+#[cfg(not(miri))]
+use rayon::prelude::*;
 
 #[cfg(feature = "with-kernels")]
 pub(crate) use jero_kernels_rvv::bf16_to_f32_finite;
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    BaselineKernel, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
+    BaselineKernel, BlockQ8_0, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
     Q4_K_M_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
-    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, VectorKernel, dequantize_token_row,
-    f16_to_f32_finite, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
+    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, QuantizedActQ8View, RepackedWeight,
+    VectorKernel, dequantize_token_row, f16_to_f32_finite, gemv_q4_0_q8_0, gemv_q5_0_q8_0,
+    quantize_row_q8_0, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
 };
 
 #[cfg(not(feature = "with-kernels"))]
@@ -629,47 +632,6 @@ pub(crate) fn dequantize_row_to_f32(
     }
 }
 
-/// Computes `output[0..rows] = weights[0..rows, 0..cols] * input[0..cols]` for either exact
-/// full-matrix projection (`output.len() == rows`) or a leading vocabulary prefix
-/// (`0 < output.len() <= rows`).
-///
-/// # Errors
-/// Returns [`K3Error::TensorBoundsError`] on shape/buffer mismatch or
-/// [`K3Error::CapabilityMismatch`] on unsupported quantization formats.
-pub(crate) fn project_matvec_prefix(
-    output: &mut [f32],
-    weights: &TensorView<'_>,
-    input: &[f32],
-) -> Result<(), K3Error> {
-    let expected_cols = input.len();
-    let (total_rows, cols) = resolve_2d_dims(weights, expected_cols)?;
-    let out_rows = output.len();
-    if out_rows == 0 || out_rows > total_rows {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: weights.name().to_owned(),
-            offset: weights.offset(),
-            byte_len: weights.byte_len(),
-            buffer_len: weights.as_bytes().len(),
-            reason: format!(
-                "output len {out_rows} out of bounds for matrix rows {total_rows} (shape {:?})",
-                weights.shape()
-            ),
-        });
-    }
-
-    if out_rows == total_rows {
-        return project_matvec_full(output, weights, total_rows, cols, input);
-    }
-
-    // Prefix projection: dequantize each requested leading row without requiring full-matrix output.
-    let mut row_buf = vec![0.0_f32; cols];
-    for (r, out_slot) in output.iter_mut().enumerate() {
-        dequantize_row_to_f32(weights, r, cols, &mut row_buf)?;
-        *out_slot = dot_product_f32(&row_buf, input);
-    }
-    Ok(())
-}
-
 /// Computes `output[0..expected_rows] = weights * input[0..expected_cols]` strictly matching
 /// full matrix output row count across all admitted Dory quantization types.
 pub(crate) fn project_matvec(
@@ -754,16 +716,15 @@ fn project_matvec_scalar(
 ) -> Result<(), K3Error> {
     match weights.quant() {
         QuantType::F32 => project_f32_rows(output, weights, rows, cols, input),
-        QuantType::F16 | QuantType::BF16 => {
-            let mut row_buf = vec![0.0_f32; cols];
-            let stride = cols * 2;
-            let raw = weights.as_bytes();
-            for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
-                decode_unquant_payload(weights, &raw[r * stride..(r + 1) * stride], &mut row_buf)?;
-                *out_slot = dot_product_f32(&row_buf, input);
-            }
-            Ok(())
-        }
+        QuantType::F16 | QuantType::BF16 => project_half_raw_rows(
+            output,
+            weights.name(),
+            weights.quant(),
+            weights.as_bytes(),
+            rows,
+            cols,
+            input,
+        ),
         QuantType::Q4_0 => dot_block_rows::<Q4_0_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES>(
             weights,
             rows,
@@ -827,12 +788,588 @@ fn project_f32_rows(
     cols: usize,
     input: &[f32],
 ) -> Result<(), K3Error> {
-    let raw = weights.as_bytes();
-    let stride = cols * 4;
-    let mut row_buf = vec![0.0_f32; cols];
+    project_f32_raw_rows(
+        output,
+        weights.name(),
+        weights.as_bytes(),
+        rows,
+        cols,
+        input,
+    )
+}
+
+/// Output-row chunk multiple guaranteeing aligned 4-row/8-row micro-kernel equivalence across
+/// `1`, `4`, and `8` worker partitions.
+pub(crate) const PARTITION_ROW_ALIGN: usize = 8;
+
+/// Descriptor for a validated row-major 2D weight payload (`total_rows x cols`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawWeightMatrix<'a> {
+    pub name: &'a str,
+    pub quant: QuantType,
+    pub total_rows: usize,
+    pub cols: usize,
+    pub raw: &'a [u8],
+}
+
+impl<'a> RawWeightMatrix<'a> {
+    pub(crate) fn from_tensor_view(
+        view: &'a TensorView<'a>,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> Result<Self, K3Error> {
+        validate_2d_dims(view, expected_rows, expected_cols)?;
+        let row_bytes = quant_row_bytes(view, expected_cols)?;
+        let req_bytes =
+            expected_rows
+                .checked_mul(row_bytes)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: view.name().to_owned(),
+                    offset: view.offset(),
+                    byte_len: view.byte_len(),
+                    buffer_len: view.as_bytes().len(),
+                    reason: "matrix byte length overflow".to_owned(),
+                })?;
+        let raw = view.as_bytes();
+        if raw.len() < req_bytes {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: view.name().to_owned(),
+                offset: view.offset(),
+                byte_len: req_bytes,
+                buffer_len: raw.len(),
+                reason: format!(
+                    "matrix raw payload {} shorter than required {req_bytes}",
+                    raw.len()
+                ),
+            });
+        }
+        Ok(Self {
+            name: view.name(),
+            quant: view.quant(),
+            total_rows: expected_rows,
+            cols: expected_cols,
+            raw,
+        })
+    }
+}
+
+/// Quantized `M = 1` activation views (`Q8_0`) reused across sibling projections.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct M1Activation<'a> {
+    pub input: &'a [f32],
+    #[cfg(feature = "with-kernels")]
+    pub q8_0: &'a [BlockQ8_0],
+}
+
+#[cfg(not(feature = "with-kernels"))]
+impl<'a> M1Activation<'a> {
+    pub(crate) const fn f32_only(input: &'a [f32]) -> Self {
+        Self { input }
+    }
+}
+
+/// Returns `true` when `quant` consumes `BlockQ8_0` (`32`-element) quantized activations on raw LM heads.
+#[inline]
+pub(crate) const fn uses_q8_0_activation(quant: QuantType) -> bool {
+    matches!(quant, QuantType::Q4_0 | QuantType::Q5_0)
+}
+
+/// Required byte length for `BlockQ8_0` scratch accommodating `max_cols` elements.
+#[inline]
+pub(crate) const fn q8_0_scratch_bytes(max_cols: usize) -> usize {
+    #[cfg(feature = "with-kernels")]
+    {
+        (max_cols / Q8_0_BLOCK_ELEMENTS).saturating_mul(size_of::<BlockQ8_0>())
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let _ = max_cols;
+        0
+    }
+}
+
+/// Converts a `128-byte`-aligned zero-initialized byte slice into a mutable `&mut [BlockQ8_0]` view.
+#[cfg(feature = "with-kernels")]
+fn bytes_to_q8_0_blocks_mut(bytes: &mut [u8], blocks: usize) -> Result<&mut [BlockQ8_0], K3Error> {
+    let needed =
+        blocks
+            .checked_mul(size_of::<BlockQ8_0>())
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "q8_0_scratch".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: bytes.len(),
+                reason: "q8_0 scratch size overflow".to_owned(),
+            })?;
+    if bytes.len() < needed {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "q8_0_scratch".to_owned(),
+            offset: 0,
+            byte_len: needed,
+            buffer_len: bytes.len(),
+            reason: format!(
+                "q8_0 scratch bytes {} shorter than required {needed}",
+                bytes.len()
+            ),
+        });
+    }
+    if blocks == 0 {
+        return Ok(&mut []);
+    }
+    let slice = &mut bytes[..needed];
+    if slice.as_ptr().align_offset(align_of::<BlockQ8_0>()) != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "q8_0_scratch".to_owned(),
+            offset: 0,
+            byte_len: needed,
+            buffer_len: slice.len(),
+            reason: "q8_0 scratch pointer is not 4-byte aligned".to_owned(),
+        });
+    }
+    slice.fill(0);
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "verified align_offset(align_of::<BlockQ8_0>()) == 0 above"
+    )]
+    let ptr = slice.as_mut_ptr().cast::<BlockQ8_0>();
+    // SAFETY: `slice` is exclusively borrowed, `BlockQ8_0`-aligned (`align_offset == 0` verified above),
+    // zero-initialized (`d: 0.0`, `qs: [0; 32]` is valid with zero padding in `#[repr(C)] BlockQ8_0`),
+    // and spans `blocks * size_of::<BlockQ8_0>()` bytes; `slice` is not accessed again.
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, blocks) })
+}
+
+/// Quantizes `input` into caller-supplied `Q8_0` scratch so sibling projections share
+/// quantized activations without heap allocation.
+#[cfg_attr(
+    not(feature = "with-kernels"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "with-kernels feature branch quantizes Q8_0 fallibly into caller scratch"
+    )
+)]
+pub(crate) fn prepare_m1_activation<'a>(
+    input: &'a [f32],
+    need_q8_0: bool,
+    q8_0_scratch: &'a mut [u8],
+) -> Result<M1Activation<'a>, K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let q8_0 = if need_q8_0 && !input.is_empty() && input.len() % Q8_0_BLOCK_ELEMENTS == 0 {
+            let blocks = input.len() / Q8_0_BLOCK_ELEMENTS;
+            let dst = bytes_to_q8_0_blocks_mut(q8_0_scratch, blocks)?;
+            quantize_row_q8_0(input, dst)?;
+            &*dst
+        } else {
+            &[]
+        };
+        Ok(M1Activation { input, q8_0 })
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let _ = (need_q8_0, q8_0_scratch);
+        Ok(M1Activation { input })
+    }
+}
+
+/// Resolves the active worker partition count, honoring explicit recipe overrides or Rayon's pool.
+#[inline]
+pub(crate) fn effective_worker_count(worker_partitions: Option<usize>) -> usize {
+    #[cfg(not(miri))]
+    {
+        worker_partitions
+            .unwrap_or_else(rayon::current_num_threads)
+            .max(1)
+    }
+    #[cfg(miri)]
+    {
+        worker_partitions.unwrap_or(1).max(1)
+    }
+}
+
+/// Computes an `8`-row-aligned chunk height so every worker chunk starts on a 4-row / 8-row boundary,
+/// preserving bit-identical GEMV outputs across `1`, `4`, and `8` worker partitions.
+#[inline]
+pub(crate) fn aligned_partition_rows(rows: usize, workers: usize) -> usize {
+    let eff = workers.max(1);
+    if eff <= 1 || rows <= PARTITION_ROW_ALIGN {
+        return rows.max(1);
+    }
+    rows.div_ceil(eff)
+        .next_multiple_of(PARTITION_ROW_ALIGN)
+        .max(PARTITION_ROW_ALIGN)
+}
+
+fn raw_row_byte_len(tensor_name: &str, quant: QuantType, cols: usize) -> Result<usize, K3Error> {
+    let Some((blk_elems, blk_bytes)) = quant_block_geometry(quant) else {
+        return Err(K3Error::unsupported_tensor_quant(
+            "dory",
+            tensor_name,
+            quant,
+        ));
+    };
+    if cols == 0 || cols % blk_elems != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: cols,
+            buffer_len: blk_elems,
+            reason: format!(
+                "column width {cols} is not a positive multiple of {quant:?} block size {blk_elems}"
+            ),
+        });
+    }
+    (cols / blk_elems)
+        .checked_mul(blk_bytes)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: cols,
+            reason: "quantized row byte stride overflow".to_owned(),
+        })
+}
+
+/// Projects `output[..out_rows] = matrix[..out_rows, ..] * act` across `workers` partitions with
+/// zero per-call heap allocations.
+pub(crate) fn project_raw_rows_partitioned(
+    output: &mut [f32],
+    matrix: RawWeightMatrix<'_>,
+    act: &M1Activation<'_>,
+    workers: usize,
+) -> Result<(), K3Error> {
+    let out_rows = output.len();
+    if out_rows == 0 || matrix.cols == 0 || out_rows > matrix.total_rows {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: matrix.name.to_owned(),
+            offset: 0,
+            byte_len: size_of_val(output),
+            buffer_len: matrix.raw.len(),
+            reason: format!(
+                "invalid row-partitioned GEMV shape out_rows={out_rows}, total_rows={}, cols={}",
+                matrix.total_rows, matrix.cols
+            ),
+        });
+    }
+    if act.input.len() != matrix.cols {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: matrix.name.to_owned(),
+            offset: 0,
+            byte_len: size_of_val(act.input),
+            buffer_len: matrix.cols,
+            reason: format!(
+                "input length {} does not match matrix cols {}",
+                act.input.len(),
+                matrix.cols
+            ),
+        });
+    }
+
+    let row_bytes = raw_row_byte_len(matrix.name, matrix.quant, matrix.cols)?;
+    let used_bytes = out_rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: matrix.name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: matrix.raw.len(),
+            reason: "partitioned output byte range overflow".to_owned(),
+        })?;
+    if matrix.raw.len() < used_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: matrix.name.to_owned(),
+            offset: 0,
+            byte_len: used_bytes,
+            buffer_len: matrix.raw.len(),
+            reason: format!(
+                "matrix payload len {} shorter than required {used_bytes}",
+                matrix.raw.len()
+            ),
+        });
+    }
+
+    let chunk_rows = aligned_partition_rows(out_rows, workers);
+    if chunk_rows >= out_rows {
+        return project_raw_row_slice(
+            output,
+            matrix.name,
+            matrix.quant,
+            matrix.cols,
+            &matrix.raw[..used_bytes],
+            act,
+        );
+    }
+
+    #[cfg(not(miri))]
+    if rayon::current_num_threads() > 1 {
+        return output.par_chunks_mut(chunk_rows).enumerate().try_for_each(
+            |(chunk_idx, out_chunk)| {
+                let start_row = chunk_idx * chunk_rows;
+                let byte_start = start_row * row_bytes;
+                let byte_end = byte_start + out_chunk.len() * row_bytes;
+                project_raw_row_slice(
+                    out_chunk,
+                    matrix.name,
+                    matrix.quant,
+                    matrix.cols,
+                    &matrix.raw[byte_start..byte_end],
+                    act,
+                )
+            },
+        );
+    }
+
+    for (chunk_idx, out_chunk) in output.chunks_mut(chunk_rows).enumerate() {
+        let start_row = chunk_idx * chunk_rows;
+        let byte_start = start_row * row_bytes;
+        let byte_end = byte_start + out_chunk.len() * row_bytes;
+        project_raw_row_slice(
+            out_chunk,
+            matrix.name,
+            matrix.quant,
+            matrix.cols,
+            &matrix.raw[byte_start..byte_end],
+            act,
+        )?;
+    }
+    Ok(())
+}
+
+/// Partitioned single-token `M = 1` RVV/IME GEMV over pre-repacked weight tiles and an
+/// arena-backed [`QuantizedActQ8View`] with zero heap allocations and zero `TILE_M = 8` waste.
+#[cfg(feature = "with-kernels")]
+pub(crate) fn project_repacked_rows_partitioned(
+    output: &mut [f32],
+    weight: &RepackedWeight,
+    act: &QuantizedActQ8View<'_>,
+    workers: usize,
+) -> Result<(), K3Error> {
+    let out_rows = output.len();
+    if out_rows == 0 || out_rows > weight.rows() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "repacked_weight".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(output),
+            buffer_len: weight.rows(),
+            reason: format!(
+                "invalid row-partitioned GEMV shape out_rows={out_rows}, total_rows={}",
+                weight.rows()
+            ),
+        });
+    }
+    let chunk_rows = aligned_partition_rows(out_rows, workers);
+    if chunk_rows >= out_rows {
+        return weight.gemv_view_rows(output, act, 0..out_rows);
+    }
+
+    #[cfg(not(miri))]
+    if rayon::current_num_threads() > 1 {
+        return output.par_chunks_mut(chunk_rows).enumerate().try_for_each(
+            |(chunk_idx, out_chunk)| {
+                let start_row = chunk_idx * chunk_rows;
+                weight.gemv_view_rows(out_chunk, act, start_row..start_row + out_chunk.len())
+            },
+        );
+    }
+
+    for (chunk_idx, out_chunk) in output.chunks_mut(chunk_rows).enumerate() {
+        let start_row = chunk_idx * chunk_rows;
+        weight.gemv_view_rows(out_chunk, act, start_row..start_row + out_chunk.len())?;
+    }
+    Ok(())
+}
+
+/// Projects `output[..rows] = matrix * input` through partitioned scalar kernels
+/// (`--no-default-features` path).
+#[cfg(not(feature = "with-kernels"))]
+pub(crate) fn project_matrix_rows_stack(
+    output: &mut [f32],
+    matrix: RawWeightMatrix<'_>,
+    input: &[f32],
+    workers: usize,
+) -> Result<(), K3Error> {
+    let act = M1Activation::f32_only(input);
+    project_raw_rows_partitioned(output, matrix, &act, workers)
+}
+
+fn project_raw_row_slice(
+    output: &mut [f32],
+    tensor_name: &str,
+    quant: QuantType,
+    cols: usize,
+    chunk_raw: &[u8],
+    act: &M1Activation<'_>,
+) -> Result<(), K3Error> {
+    if quant == QuantType::F32 {
+        return project_f32_raw_rows(
+            output,
+            tensor_name,
+            chunk_raw,
+            output.len(),
+            cols,
+            act.input,
+        );
+    }
+
+    let dims = [cols, output.len()];
+    let sub_view = TensorView::from_bytes(tensor_name, quant, &dims, 0, chunk_raw)?;
+
+    #[cfg(feature = "with-kernels")]
+    {
+        match quant {
+            QuantType::Q4_0 if !act.q8_0.is_empty() => gemv_q4_0_q8_0(output, &sub_view, act.q8_0),
+            QuantType::Q5_0 if !act.q8_0.is_empty() => gemv_q5_0_q8_0(output, &sub_view, act.q8_0),
+            QuantType::Q4_0 => vec_dot_q4_0(output, &sub_view, act.input),
+            QuantType::Q8_0 => BaselineKernel::new().vec_dot_q8_0(output, &sub_view, act.input),
+            QuantType::Q4_K_M => BaselineKernel::new().vec_dot_q4_k_m(output, &sub_view, act.input),
+            QuantType::Q5_K => BaselineKernel::new().vec_dot_q5_k(output, &sub_view, act.input),
+            QuantType::Q6_K => BaselineKernel::new().vec_dot_q6_k(output, &sub_view, act.input),
+            QuantType::Q5_0 => dot_block_rows::<Q5_0_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES>(
+                &sub_view,
+                output.len(),
+                cols,
+                act.input,
+                output,
+                dequantize_q5_0_block,
+            ),
+            QuantType::F16 => vec_dot_f16(output, &sub_view, act.input),
+            QuantType::BF16 => vec_dot_bf16(output, &sub_view, act.input),
+            _ => Err(K3Error::unsupported_tensor_quant(
+                "dory",
+                tensor_name,
+                quant,
+            )),
+        }
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        project_matvec_scalar(output, &sub_view, output.len(), cols, act.input)
+    }
+}
+
+fn project_f32_raw_rows(
+    output: &mut [f32],
+    tensor_name: &str,
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let stride = cols
+        .checked_mul(4)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: raw.len(),
+            reason: "f32 row stride overflow".to_owned(),
+        })?;
+    let required = rows
+        .checked_mul(stride)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: raw.len(),
+            reason: "f32 matrix byte length overflow".to_owned(),
+        })?;
+    if raw.len() < required || input.len() != cols {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: required,
+            buffer_len: raw.len(),
+            reason: "f32 matrix slice shorter than expected row payload".to_owned(),
+        });
+    }
+    let mut chunk_buf = [0.0_f32; 256];
     for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
-        decode_unquant_payload(weights, &raw[r * stride..(r + 1) * stride], &mut row_buf)?;
-        *out_slot = dot_product_f32(&row_buf, input);
+        let row_bytes = &raw[r * stride..(r + 1) * stride];
+        let mut sum = 0.0_f32;
+        let mut col = 0usize;
+        for chunk in row_bytes.chunks(chunk_buf.len() * 4) {
+            let n = chunk.len() / 4;
+            for (dst, b) in chunk_buf[..n].iter_mut().zip(chunk.chunks_exact(4)) {
+                *dst = sanitize_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            for (&w, &x) in chunk_buf[..n].iter().zip(&input[col..col + n]) {
+                sum += w * x;
+            }
+            col += n;
+        }
+        *out_slot = sum;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "with-kernels"))]
+fn project_half_raw_rows(
+    output: &mut [f32],
+    tensor_name: &str,
+    quant: QuantType,
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let stride = cols
+        .checked_mul(2)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: raw.len(),
+            reason: "half row stride overflow".to_owned(),
+        })?;
+    let required = rows
+        .checked_mul(stride)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: raw.len(),
+            reason: "half matrix byte length overflow".to_owned(),
+        })?;
+    if raw.len() < required || input.len() != cols {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: required,
+            buffer_len: raw.len(),
+            reason: "half matrix slice shorter than expected row payload".to_owned(),
+        });
+    }
+    let mut chunk_buf = [0.0_f32; 256];
+    for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let row_bytes = &raw[r * stride..(r + 1) * stride];
+        let mut sum = 0.0_f32;
+        let mut col = 0usize;
+        for chunk in row_bytes.chunks(chunk_buf.len() * 2) {
+            let n = chunk.len() / 2;
+            match quant {
+                QuantType::F16 => {
+                    for (dst, b) in chunk_buf[..n].iter_mut().zip(chunk.chunks_exact(2)) {
+                        *dst = f16_to_f32_finite(u16::from_le_bytes([b[0], b[1]]));
+                    }
+                }
+                QuantType::BF16 => {
+                    for (dst, b) in chunk_buf[..n].iter_mut().zip(chunk.chunks_exact(2)) {
+                        *dst = bf16_to_f32_finite(u16::from_le_bytes([b[0], b[1]]));
+                    }
+                }
+                _ => {
+                    return Err(K3Error::unsupported_tensor_quant(
+                        "dory",
+                        tensor_name,
+                        quant,
+                    ));
+                }
+            }
+            for (&w, &x) in chunk_buf[..n].iter().zip(&input[col..col + n]) {
+                sum += w * x;
+            }
+            col += n;
+        }
+        *out_slot = sum;
     }
     Ok(())
 }

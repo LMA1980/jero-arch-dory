@@ -1,0 +1,18 @@
+version: "1"
+service: "jero-arch-dory"
+license: "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
+
+target_nodes:
+  - "worker-riscv64"
+
+lease_ttl_seconds: 300
+warmup_timeout_seconds: 30
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
+integration_tests: "all"
+
+ab_rules:
+  btrfs_snapshots: true
+  keep_snapshots: 5
+  auto_rollback_on_critical: true

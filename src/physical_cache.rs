@@ -11,11 +11,13 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 
+#[cfg(feature = "with-kernels")]
+use jero_core::ScratchWorkspace;
 use jero_core::{GgufArray, GgufFile, K3Error, ModelWeights, QuantType, StopCriteria, TensorView};
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    QuantizedActQ8, RepackedWeight, gemm_repacked_f32, gemm_repacked_rows, gemv_repacked_f32,
-    gemv_repacked_f32_rows,
+    QuantizedActQ8, QuantizedActQ8View, RepackedWeight, gemm_repacked_f32, gemm_repacked_rows,
+    precompute_rope_inv_freq,
 };
 
 use crate::quant;
@@ -338,13 +340,9 @@ pub(crate) fn validate_1d_scale_view(
 pub struct DoryCachedWeight {
     #[cfg(feature = "with-kernels")]
     inner: RepackedWeight,
-    #[cfg(not(feature = "with-kernels"))]
     tensor_name: String,
-    #[cfg(not(feature = "with-kernels"))]
     quant: QuantType,
-    #[cfg(not(feature = "with-kernels"))]
     rows: usize,
-    #[cfg(not(feature = "with-kernels"))]
     cols: usize,
     #[cfg(not(feature = "with-kernels"))]
     byte_len: usize,
@@ -375,13 +373,9 @@ impl DoryCachedWeight {
         quant::validate_2d_dims(view, expected_rows, expected_cols)?;
 
         #[cfg(feature = "with-kernels")]
-        {
-            let inner = RepackedWeight::from_tensor(view, expected_rows, expected_cols)?;
-            Ok(Self { inner })
-        }
-
+        let inner = RepackedWeight::from_tensor(view, expected_rows, expected_cols)?;
         #[cfg(not(feature = "with-kernels"))]
-        {
+        let (byte_len, blocks) = {
             let raw = view.as_bytes();
             let byte_len = raw.len();
             let mut blocks = vec![RawAligned128::default(); byte_len.div_ceil(128).max(1)];
@@ -391,15 +385,21 @@ impl DoryCachedWeight {
                 core::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<u8>(), byte_len)
             };
             dst.copy_from_slice(raw);
-            Ok(Self {
-                tensor_name: view.name().to_owned(),
-                quant: view.quant(),
-                rows: expected_rows,
-                cols: expected_cols,
-                byte_len,
-                blocks,
-            })
-        }
+            (byte_len, blocks)
+        };
+
+        Ok(Self {
+            #[cfg(feature = "with-kernels")]
+            inner,
+            tensor_name: view.name().to_owned(),
+            quant: view.quant(),
+            rows: expected_rows,
+            cols: expected_cols,
+            #[cfg(not(feature = "with-kernels"))]
+            byte_len,
+            #[cfg(not(feature = "with-kernels"))]
+            blocks,
+        })
     }
 
     /// Loads `tensor_name` from `weights` and repacks it for `(expected_rows, expected_cols)`.
@@ -427,40 +427,19 @@ impl DoryCachedWeight {
     /// Number of output rows `N`.
     #[must_use]
     pub const fn rows(&self) -> usize {
-        #[cfg(feature = "with-kernels")]
-        {
-            self.inner.rows()
-        }
-        #[cfg(not(feature = "with-kernels"))]
-        {
-            self.rows
-        }
+        self.rows
     }
 
     /// Number of logical input columns `K`.
     #[must_use]
     pub const fn cols(&self) -> usize {
-        #[cfg(feature = "with-kernels")]
-        {
-            self.inner.cols()
-        }
-        #[cfg(not(feature = "with-kernels"))]
-        {
-            self.cols
-        }
+        self.cols
     }
 
     /// Source GGUF [`QuantType`] prior to load-time repacking.
     #[must_use]
     pub const fn quant(&self) -> QuantType {
-        #[cfg(feature = "with-kernels")]
-        {
-            self.inner.quant()
-        }
-        #[cfg(not(feature = "with-kernels"))]
-        {
-            self.quant
-        }
+        self.quant
     }
 
     /// Total bytes occupied by this cached matrix's `128-byte`-aligned buffer.
@@ -489,6 +468,80 @@ impl DoryCachedWeight {
         }
     }
 
+    #[cfg(not(feature = "with-kernels"))]
+    #[inline]
+    pub(crate) fn as_raw_matrix(&self) -> quant::RawWeightMatrix<'_> {
+        // SAFETY: `RawAligned128` has no padding and `self.byte_len <= self.blocks.len() * 128`.
+        let payload = unsafe {
+            core::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.byte_len)
+        };
+        quant::RawWeightMatrix {
+            name: &self.tensor_name,
+            quant: self.quant,
+            total_rows: self.rows,
+            cols: self.cols,
+            raw: payload,
+        }
+    }
+
+    /// Evaluates single-token `M = 1` row-partitioned GEMV over repacked weights and an
+    /// arena-backed [`QuantizedActQ8View`] with zero heap allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if vector lengths mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub(crate) fn project_m1_repacked(
+        &self,
+        output: &mut [f32],
+        act: &QuantizedActQ8View<'_>,
+        workers: usize,
+    ) -> Result<(), K3Error> {
+        if output.len() != self.rows {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.tensor_name.clone(),
+                offset: 0,
+                byte_len: size_of_val(output),
+                buffer_len: self.rows,
+                reason: format!(
+                    "output len {} does not match cached weight rows {}",
+                    output.len(),
+                    self.rows
+                ),
+            });
+        }
+        quant::project_repacked_rows_partitioned(output, &self.inner, act, workers)
+    }
+
+    /// Evaluates single-token `M = 1` row-partitioned GEMV from scalar activation slices without
+    /// per-token heap allocations (`--no-default-features` path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if vector lengths mismatch.
+    #[cfg(not(feature = "with-kernels"))]
+    pub(crate) fn project_m1_prequantized(
+        &self,
+        output: &mut [f32],
+        act: &quant::M1Activation<'_>,
+        workers: usize,
+    ) -> Result<(), K3Error> {
+        if output.len() != self.rows {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.tensor_name.clone(),
+                offset: 0,
+                byte_len: size_of_val(output),
+                buffer_len: self.rows,
+                reason: format!(
+                    "output len {} does not match cached weight rows {}",
+                    output.len(),
+                    self.rows
+                ),
+            });
+        }
+        quant::project_raw_rows_partitioned(output, self.as_raw_matrix(), act, workers)
+    }
+
     /// Evaluates single-token matrix-vector projection `output = self * input` (`output.len() == self.rows()`,
     /// `input.len() == self.cols()`).
     ///
@@ -496,20 +549,20 @@ impl DoryCachedWeight {
     ///
     /// Returns [`K3Error::TensorBoundsError`] if vector lengths mismatch.
     pub fn project_f32(&self, output: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
-        #[cfg(feature = "with-kernels")]
-        {
-            gemv_repacked_f32(output, &self.inner, input)
+        if output.len() != self.rows {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.tensor_name.clone(),
+                offset: 0,
+                byte_len: size_of_val(output),
+                buffer_len: self.rows,
+                reason: format!(
+                    "output len {} does not match cached weight rows {}",
+                    output.len(),
+                    self.rows
+                ),
+            });
         }
-        #[cfg(not(feature = "with-kernels"))]
-        {
-            // SAFETY: `RawAligned128` has no padding and `self.byte_len <= self.blocks.len() * 128`.
-            let payload = unsafe {
-                core::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.byte_len)
-            };
-            let dims = [self.cols, self.rows];
-            let view = TensorView::from_bytes(&self.tensor_name, self.quant, &dims, 0, payload)?;
-            quant::project_matvec(output, &view, input)
-        }
+        self.project_prefix_f32(output, input)
     }
 
     /// Evaluates a leading-row prefix GEMV (`0 < output.len() <= self.rows()`).
@@ -518,19 +571,30 @@ impl DoryCachedWeight {
     ///
     /// Returns [`K3Error::TensorBoundsError`] on empty/oversized `output` or mismatched `input`.
     pub fn project_prefix_f32(&self, output: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
+        if input.len() != self.cols {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.tensor_name.clone(),
+                offset: 0,
+                byte_len: size_of_val(input),
+                buffer_len: self.cols,
+                reason: format!(
+                    "input len {} does not match cached weight cols {}",
+                    input.len(),
+                    self.cols
+                ),
+            });
+        }
+        let workers = quant::effective_worker_count(None);
         #[cfg(feature = "with-kernels")]
         {
-            gemv_repacked_f32_rows(output, &self.inner, input, 0..output.len())
+            let req = QuantizedActQ8View::scratch_bytes_for_row(self.cols);
+            let mut ws = ScratchWorkspace::new(req)?;
+            let view = QuantizedActQ8View::quantize_row_in_scratch(input, &mut ws)?;
+            quant::project_repacked_rows_partitioned(output, &self.inner, &view, workers)
         }
         #[cfg(not(feature = "with-kernels"))]
         {
-            // SAFETY: `RawAligned128` has no padding and `self.byte_len <= self.blocks.len() * 128`.
-            let payload = unsafe {
-                core::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.byte_len)
-            };
-            let dims = [self.cols, self.rows];
-            let view = TensorView::from_bytes(&self.tensor_name, self.quant, &dims, 0, payload)?;
-            quant::project_matvec_prefix(output, &view, input)
+            quant::project_matrix_rows_stack(output, self.as_raw_matrix(), input, workers)
         }
     }
 
@@ -1180,8 +1244,38 @@ impl DoryStopMetadata {
 #[derive(Debug, Clone)]
 pub struct DoryPhysicalCache {
     sublayers: Vec<DoryPhysicalSubLayer>,
+    has_output_weight: bool,
     output_scale: Option<AlignedF32Vec>,
+    inv_freq_swa: AlignedF32Vec,
+    inv_freq_full: AlignedF32Vec,
     stop_metadata: DoryStopMetadata,
+}
+
+fn build_rope_inv_freq_vec(head_dim: usize, theta: f32) -> Result<AlignedF32Vec, K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let table = precompute_rope_inv_freq(head_dim, theta, None, head_dim)?;
+        Ok(AlignedF32Vec::from_slice(&table))
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let half = head_dim / 2;
+        if half == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "dory".to_owned(),
+                reason: format!("invalid Dory RoPE parameters head_dim={head_dim}, theta={theta}"),
+            });
+        }
+        let mut table = AlignedF32Vec::with_zeroed_len(half);
+        #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
+        let denom = head_dim as f32;
+        for (i, slot) in table.as_mut_f32_capacity()[..half].iter_mut().enumerate() {
+            #[expect(clippy::cast_precision_loss, reason = "pair index fits f32")]
+            let exp = (2 * i) as f32 / denom;
+            *slot = 1.0_f32 / theta.powf(exp);
+        }
+        Ok(table)
+    }
 }
 
 impl DoryPhysicalCache {
@@ -1213,11 +1307,12 @@ impl DoryPhysicalCache {
         }
 
         let hidden_dim = (recipe.hidden_dim as usize).max(2);
+        let has_output_weight = weights.contains_tensor("output.weight");
         let output_scale = if weights.contains_tensor("output_scale.weight") {
-            let vocab_rows = if let Ok(out_w) = weights.tensor("output.weight") {
-                quant::resolve_2d_dims(&out_w, hidden_dim)?.0
-            } else if let Ok(embd_w) = weights.tensor("token_embd.weight") {
-                quant::resolve_2d_dims(&embd_w, hidden_dim)?.0
+            let vocab_rows = if has_output_weight {
+                quant::resolve_2d_dims(&weights.tensor("output.weight")?, hidden_dim)?.0
+            } else if weights.contains_tensor("token_embd.weight") {
+                quant::resolve_2d_dims(&weights.tensor("token_embd.weight")?, hidden_dim)?.0
             } else {
                 recipe.vocab_size
             };
@@ -1230,9 +1325,16 @@ impl DoryPhysicalCache {
             None
         };
 
+        let head_dim = (recipe.head_dim as usize).max(2);
+        let inv_freq_swa = build_rope_inv_freq_vec(head_dim, recipe.rope_theta_swa)?;
+        let inv_freq_full = build_rope_inv_freq_vec(head_dim, recipe.rope_theta_full)?;
+
         Ok(Self {
             sublayers,
+            has_output_weight,
             output_scale,
+            inv_freq_swa,
+            inv_freq_full,
             stop_metadata: recipe.stop_metadata.clone(),
         })
     }
@@ -1300,6 +1402,13 @@ impl DoryPhysicalCache {
         self.output_scale.as_ref()
     }
 
+    /// Returns `true` when `output.weight` exists (untied LM head); `false` selects tied
+    /// `token_embd.weight` without probing `weights.contains_tensor("output.weight")` per token.
+    #[must_use]
+    pub const fn has_output_weight(&self) -> bool {
+        self.has_output_weight
+    }
+
     /// Borrows the aligned `ChatML` (`<|im_end|>`) and `<think>` stop-token metadata.
     #[must_use]
     pub const fn stop_metadata(&self) -> &DoryStopMetadata {
@@ -1327,6 +1436,23 @@ impl DoryPhysicalCache {
             .output_scale
             .as_ref()
             .map_or(0, AlignedF32Vec::aligned_bytes);
-        sub_bytes + out_bytes
+        sub_bytes
+            + out_bytes
+            + self.inv_freq_swa.aligned_bytes()
+            + self.inv_freq_full.aligned_bytes()
+    }
+
+    /// Borrows the precomputed `128-byte`-aligned `RoPE` inverse frequency table for sliding-window
+    /// attention sub-layers (`dory.rope.freq_base_2`).
+    #[must_use]
+    pub fn rope_inv_freq_swa(&self) -> &[f32] {
+        self.inv_freq_swa.as_slice()
+    }
+
+    /// Borrows the precomputed `128-byte`-aligned `RoPE` inverse frequency table for full-attention
+    /// sub-layers (`dory.rope.freq_base`).
+    #[must_use]
+    pub fn rope_inv_freq_full(&self) -> &[f32] {
+        self.inv_freq_full.as_slice()
     }
 }
