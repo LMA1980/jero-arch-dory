@@ -1,9 +1,15 @@
 //! `jero-arch-dory`: NVIDIA Nemotron-Labs Dory1.0 looped latent-recurrent nGPT architecture recipe
 //! for the `SpacemiT` K3 platform.
 
+pub mod physical_cache;
 mod quant;
 pub mod recipe;
 
+pub use physical_cache::{
+    AlignedF32Block, AlignedF32Vec, DORY_BOS_TOKEN, DORY_EOS_TOKEN, DORY_IM_START_TOKEN,
+    DORY_MEDIUM_REASONING_SUFFIX, DORY_THINK_CLOSE_TOKEN, DORY_THINK_OPEN_TOKEN, DoryCachedWeight,
+    DoryPhysicalCache, DoryPhysicalSubLayer, DoryStopMetadata,
+};
 pub use recipe::{
     CANONICAL_DORY_LAYER_PATTERN, DORY_DEFAULT_VOCAB_SIZE, DORY_L2_EPS, DoryKvCacheMode,
     DoryPhysicalLayerWeights, DoryRecipe, DorySubLayerKind, apply_neox_rope,
@@ -1462,5 +1468,443 @@ mod tests {
         ctx_ll.prepare_decode(2).unwrap();
         last_loop_small.decode_step(&mut ctx_ll, &owned_ll).unwrap();
         assert_eq!(ctx_ll.position(), 3);
+    }
+
+    fn encode_f32_slice(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "verifies physical-only caching, 128B alignment, and fail-closed admission"
+    )]
+    fn test_physical_cache_allocation_128b_alignment_and_fail_closed() {
+        use std::sync::Arc;
+
+        // 1. Supported quant admission matrix check.
+        for q in [
+            QuantType::F32,
+            QuantType::F16,
+            QuantType::BF16,
+            QuantType::Q4_0,
+            QuantType::Q5_0,
+            QuantType::Q8_0,
+            QuantType::Q4_K_M,
+            QuantType::Q5_K,
+            QuantType::Q6_K,
+        ] {
+            assert!(DoryRecipe::is_supported_quant(q));
+        }
+        assert!(!DoryRecipe::is_supported_quant(QuantType::Q4_1));
+
+        // Canonical 40-layer and 72-layer virtual counts never multiply physical entries.
+        let canonical = DoryRecipe::new();
+        assert_eq!(canonical.physical_layer_count(), 72);
+        assert_eq!(canonical.virtual_layer_count(), 112);
+
+        // 2. Empty weights fail closed cleanly.
+        let recipe = compact_test_recipe("S-*", 1, 1, 1, 4);
+        assert_eq!(recipe.physical_layer_count(), 3);
+        assert_eq!(recipe.virtual_layer_count(), 6);
+        let empty = EmptyWeights;
+        assert!(recipe.build_physical_cache(&empty).is_err());
+
+        // 3. Unsupported quant fails closed in DoryCachedWeight::from_tensor_view.
+        let unsupported =
+            TensorView::from_bytes("bad.weight", QuantType::Q4_1, &[32, 1], 0, &[0_u8; 20])
+                .unwrap();
+        assert!(DoryCachedWeight::from_tensor_view(&unsupported, 1, 32).is_err());
+
+        // 4. Build cache on compact 3-physical / 6-virtual (n_loops=4) model with output_scale.
+        let mut weights = OwnedTestWeights::for_recipe(&recipe, 4, true);
+        weights.upsert(
+            "output_scale.weight",
+            QuantType::F32,
+            vec![4],
+            encode_f32_slice(&[0.5, 1.0, 1.5, 2.0]),
+        );
+
+        let cache = recipe.build_physical_cache(&weights).unwrap();
+        // Strictly physical count (3), never virtual count (6).
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.is_empty());
+        assert_eq!(cache.repacked_matrix_count(), 5 + 3 + 5);
+        assert!(cache.total_aligned_bytes() > 0);
+        assert_eq!(cache.total_aligned_bytes() % 128, 0);
+        assert!(cache.get(3).is_err());
+
+        let out_scale = cache.output_scale().expect("output_scale cached");
+        assert!(out_scale.is_aligned_128());
+        assert_eq!(out_scale.as_slice(), &[0.5, 1.0, 1.5, 2.0]);
+
+        for sub in cache.sublayers() {
+            assert!(sub.residual_alpha().is_aligned_128());
+            match sub {
+                DoryPhysicalSubLayer::Attention {
+                    wq,
+                    wk,
+                    wv,
+                    wgate,
+                    wo,
+                    sqk,
+                    attn_alpha,
+                    attn_gate,
+                    ..
+                } => {
+                    for w in [wq, wk, wv, wgate, wo] {
+                        assert_eq!(w.payload_ptr().align_offset(128), 0);
+                        assert_eq!(w.aligned_bytes() % 128, 0);
+                        #[cfg(feature = "with-kernels")]
+                        assert_eq!(w.repacked().payload_ptr().align_offset(128), 0);
+                    }
+                    assert!(sqk.is_aligned_128());
+                    assert!(attn_alpha.is_aligned_128());
+                    assert!(attn_gate.is_aligned_128());
+                }
+                DoryPhysicalSubLayer::Mlp {
+                    wup,
+                    wgate,
+                    wdown,
+                    suv,
+                    mlp_alpha,
+                    mlp_gate,
+                    ..
+                } => {
+                    for w in [wup, wgate, wdown] {
+                        assert_eq!(w.payload_ptr().align_offset(128), 0);
+                        assert_eq!(w.aligned_bytes() % 128, 0);
+                        #[cfg(feature = "with-kernels")]
+                        assert_eq!(w.repacked().payload_ptr().align_offset(128), 0);
+                    }
+                    assert!(suv.is_aligned_128());
+                    assert!(mlp_alpha.is_aligned_128());
+                    assert!(mlp_gate.is_aligned_128());
+                }
+            }
+        }
+
+        // 5. Shared Arc<DoryPhysicalCache> attach/clear lifecycle matches uncached execution.
+        let mut cached_recipe = recipe.clone().with_physical_cache(Arc::new(cache));
+        assert!(cached_recipe.physical_cache().is_some());
+        let mut kv_uncached = vec![0.0_f32; 4 * 2 * 4 * 2];
+        let mut logits_uncached = [0.0_f32; 4];
+        let mut ctx_u =
+            ExecutionContext::new(&[0, 1], 4, &mut logits_uncached, &mut kv_uncached).unwrap();
+        recipe.prefill_step(&mut ctx_u, &weights).unwrap();
+        ctx_u.prepare_decode(2).unwrap();
+        recipe.decode_step(&mut ctx_u, &weights).unwrap();
+
+        let mut kv_cached = vec![0.0_f32; 4 * 2 * 4 * 2];
+        let mut logits_cached = [0.0_f32; 4];
+        let mut ctx_c =
+            ExecutionContext::new(&[0, 1], 4, &mut logits_cached, &mut kv_cached).unwrap();
+        cached_recipe.prefill_step(&mut ctx_c, &weights).unwrap();
+        ctx_c.prepare_decode(2).unwrap();
+        cached_recipe.decode_step(&mut ctx_c, &weights).unwrap();
+
+        for (a, b) in logits_uncached.iter().zip(logits_cached.iter()) {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!((a - b).abs() < tol, "cached vs uncached diff: {a} vs {b}");
+        }
+
+        cached_recipe.clear_physical_cache();
+        assert!(cached_recipe.physical_cache().is_none());
+        cached_recipe.attach_physical_cache(&weights).unwrap();
+        assert_eq!(cached_recipe.physical_cache().unwrap().len(), 3);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "verifies AlignedF32Vec F32/F16/BF16 decoding and init_std/alpha_init/gate_init scaling"
+    )]
+    fn test_aligned_scale_vectors_and_effective_ngpt_init_scaling() {
+        // Test AlignedF32Vec across F32 / F16 / BF16 / splat / from_slice / non-finite hygiene.
+        assert!(AlignedF32Vec::empty().is_empty());
+        assert!(AlignedF32Vec::empty().is_aligned_128());
+        let splat_vec = AlignedF32Vec::splat(f32::NAN, 4);
+        assert_eq!(splat_vec.as_slice(), &[0.0; 4]);
+        assert!(splat_vec.is_aligned_128());
+        let copied = AlignedF32Vec::from_slice(&[1.0, -2.0, 3.0]);
+        assert!(copied.is_aligned_128());
+        assert_eq!(copied.as_slice(), &[1.0, -2.0, 3.0]);
+
+        let mut recipe = compact_test_recipe("S-", 1, 1, 0, 2);
+        recipe.init_std = 0.025;
+        recipe.alpha_init = 0.12;
+        recipe.gate_init = 12.0;
+        recipe.logit_scale = Some(0.5);
+
+        let mut weights = OwnedTestWeights::for_recipe(&recipe, 4, true);
+        // F16 sqk (`blk.0.attn_qk_scale.weight`)
+        let sqk_vals = [0.25_f32, 0.5, 0.75, 1.0];
+        let mut f16_bytes = Vec::with_capacity(8);
+        for v in sqk_vals {
+            f16_bytes.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        weights.upsert(
+            "blk.0.attn_qk_scale.weight",
+            QuantType::F16,
+            vec![4],
+            f16_bytes,
+        );
+        // BF16 residual_alpha (`blk.0.residual_alpha.weight` & `blk.1.residual_alpha.weight`)
+        let alpha_vals = [0.1_f32, 0.2, 0.3, 0.4];
+        let mut bf16_bytes = Vec::with_capacity(8);
+        for v in alpha_vals {
+            bf16_bytes.extend_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+        }
+        weights.upsert(
+            "blk.0.residual_alpha.weight",
+            QuantType::BF16,
+            vec![4],
+            bf16_bytes.clone(),
+        );
+        weights.upsert(
+            "blk.1.residual_alpha.weight",
+            QuantType::BF16,
+            vec![4],
+            bf16_bytes,
+        );
+        // F32 gate / up / output scales (realistic init_std magnitude so sigmoid gate is unsaturated)
+        weights.upsert(
+            "blk.0.attn_gate_scale.weight",
+            QuantType::F32,
+            vec![4],
+            encode_f32_slice(&[0.01, 0.015, 0.02, 0.025]),
+        );
+        weights.upsert(
+            "blk.1.ffn_up_scale.weight",
+            QuantType::F32,
+            vec![4],
+            encode_f32_slice(&[0.02, 0.03, 0.025, 0.015]),
+        );
+        weights.upsert(
+            "blk.1.ffn_gate_scale.weight",
+            QuantType::F32,
+            vec![4],
+            encode_f32_slice(&[0.015, 0.025, 0.03, 0.02]),
+        );
+        weights.upsert(
+            "output_scale.weight",
+            QuantType::F32,
+            vec![4],
+            encode_f32_slice(&[0.05, 0.1, 0.15, 0.2]),
+        );
+
+        let cache = recipe.build_physical_cache(&weights).unwrap();
+        let legacy_sqk =
+            extract_scale_vector_f32(&weights, "blk.0.attn_qk_scale.weight", 4).unwrap();
+        let legacy_alpha =
+            extract_scale_vector_f32(&weights, "blk.0.residual_alpha.weight", 4).unwrap();
+        match cache.get(0).unwrap() {
+            DoryPhysicalSubLayer::Attention {
+                sqk, attn_alpha, ..
+            } => {
+                assert_eq!(sqk.as_slice(), legacy_sqk.as_slice());
+                assert_eq!(attn_alpha.as_slice(), legacy_alpha.as_slice());
+            }
+            DoryPhysicalSubLayer::Mlp { .. } => panic!("expected physical sub-layer 0 Attention"),
+        }
+
+        // Verify init_std and gate_init affect output identically without sigmoid saturation.
+        let mut alt_recipe = recipe.clone();
+        alt_recipe.init_std = 0.06;
+        alt_recipe.gate_init = 2.0;
+        let alt_cache = alt_recipe.build_physical_cache(&weights).unwrap();
+
+        let mut kv0 = vec![0.0_f32; 3 * 2 * 4 * 2];
+        let mut logits0 = [0.0_f32; 4];
+        let mut ctx0 = ExecutionContext::new(&[0, 1], 4, &mut logits0, &mut kv0).unwrap();
+        recipe
+            .clone()
+            .with_physical_cache(std::sync::Arc::new(cache))
+            .prefill_step(&mut ctx0, &weights)
+            .unwrap();
+
+        let mut kv1 = vec![0.0_f32; 3 * 2 * 4 * 2];
+        let mut logits1 = [0.0_f32; 4];
+        let mut ctx1 = ExecutionContext::new(&[0, 1], 4, &mut logits1, &mut kv1).unwrap();
+        alt_recipe
+            .with_physical_cache(std::sync::Arc::new(alt_cache))
+            .prefill_step(&mut ctx1, &weights)
+            .unwrap();
+
+        assert!(
+            logits0
+                .iter()
+                .zip(logits1.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-4),
+            "init_std/gate_init scaling must affect logits: {logits0:?} vs {logits1:?}"
+        );
+
+        // Verify alpha_init fallback populates AlignedF32Vec when residual_alpha tensor is omitted.
+        let weights_no_alpha = OwnedTestWeights::for_recipe(&recipe, 4, true);
+        let mut r_a = recipe.clone();
+        r_a.alpha_init = 0.10;
+        let c_a = r_a.build_physical_cache(&weights_no_alpha).unwrap();
+        assert_eq!(c_a.get(0).unwrap().residual_alpha().as_slice(), &[0.10; 4]);
+
+        let mut r_b = recipe;
+        r_b.alpha_init = 0.40;
+        let c_b = r_b.build_physical_cache(&weights_no_alpha).unwrap();
+        assert_eq!(c_b.get(0).unwrap().residual_alpha().as_slice(), &[0.40; 4]);
+
+        let mut kv_a = vec![0.0_f32; 3 * 2 * 4 * 2];
+        let mut logits_a = [0.0_f32; 4];
+        let mut ctx_a = ExecutionContext::new(&[0, 1], 4, &mut logits_a, &mut kv_a).unwrap();
+        r_a.with_physical_cache(std::sync::Arc::new(c_a))
+            .prefill_step(&mut ctx_a, &weights_no_alpha)
+            .unwrap();
+
+        let mut kv_b = vec![0.0_f32; 3 * 2 * 4 * 2];
+        let mut logits_b = [0.0_f32; 4];
+        let mut ctx_b = ExecutionContext::new(&[0, 1], 4, &mut logits_b, &mut kv_b).unwrap();
+        r_b.with_physical_cache(std::sync::Arc::new(c_b))
+            .prefill_step(&mut ctx_b, &weights_no_alpha)
+            .unwrap();
+        assert!(
+            logits_a
+                .iter()
+                .zip(logits_b.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-4),
+            "alpha_init default residual_alpha must affect logits"
+        );
+    }
+
+    #[test]
+    fn test_stop_metadata_chatml_and_think_tokens_alignment() {
+        use jero_core::{
+            GgufArray, GgufFile, GgufValue, StopReason,
+            test_helpers::create_synthetic_gguf_v3_with_kvs,
+        };
+
+        let tokens = vec![
+            "<unk>",
+            "<s>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<think>",
+            "</think>",
+            "</s>",
+            "hello",
+        ];
+        let kvs = [
+            ("dory.block_count", GgufValue::Uint32(0)),
+            ("dory.input_layer_count", GgufValue::Uint32(1)),
+            ("dory.recurrent_layer_count", GgufValue::Uint32(1)),
+            ("dory.output_layer_count", GgufValue::Uint32(1)),
+            ("dory.num_loops", GgufValue::Uint32(1)),
+            (
+                "dory.recurrent_kv_cache_mode",
+                GgufValue::String("per_loop"),
+            ),
+            ("dory.layer_pattern", GgufValue::String("S-*")),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(3)),
+            ("tokenizer.ggml.eot_token_id", GgufValue::Uint32(3)),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.chat_template",
+                GgufValue::String(
+                    "<s><|im_start|>user\n{{ content }}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                ),
+            ),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("dory", 32, &kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).unwrap();
+
+        let recipe = DoryRecipe::from_gguf(&gguf).unwrap();
+        let meta = &recipe.stop_metadata;
+        assert_eq!(meta.bos_token_id, Some(1));
+        assert_eq!(meta.im_start_token_id, Some(2));
+        assert_eq!(meta.im_end_token_id, Some(3));
+        assert_eq!(meta.eos_token_id, Some(3));
+        assert_eq!(meta.think_open_token_id, Some(4));
+        assert_eq!(meta.think_close_token_id, Some(5));
+        assert!(meta.chatml_template_aligned);
+        assert!(meta.has_think_tokens);
+
+        // `<|im_end|>` stops generation; `<think>` and `</think>` never trigger stop.
+        assert!(meta.is_stop_token(3));
+        assert!(!meta.is_stop_token(4));
+        assert!(!meta.is_stop_token(5));
+        assert!(meta.is_reasoning_token(4));
+        assert!(meta.is_reasoning_token(5));
+        assert!(!meta.is_reasoning_token(3));
+
+        let criteria = meta.stop_criteria(16, 64);
+        assert_eq!(criteria.evaluate(4, 1, 2), None);
+        assert_eq!(criteria.evaluate(7, 2, 3), None);
+        assert_eq!(criteria.evaluate(5, 3, 4), None);
+        assert_eq!(criteria.evaluate(3, 4, 5), Some(StopReason::EosToken(3)));
+
+        let default_prompt = meta.format_chatml_prompt("Explain RVV", None, true);
+        assert_eq!(
+            default_prompt,
+            "<s><|im_start|>user\nExplain RVV<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        let medium_prompt = meta.format_chatml_prompt("Explain RVV", Some("medium"), true);
+        assert!(medium_prompt.contains(DORY_MEDIUM_REASONING_SUFFIX));
+        let disabled_prompt = meta.format_chatml_prompt("Explain RVV", Some("low"), true);
+        assert!(disabled_prompt.ends_with("<|im_start|>assistant\n<think></think>"));
+    }
+
+    #[test]
+    fn test_cached_quant_q4_0_and_q8_0_projection_parity() {
+        let q4_bytes = encode_q4_0_blocks(2, 32, 0.25);
+        let q8_bytes = encode_q8_0_blocks(2, 32, 0.25);
+        let input: Vec<f32> = (0..32)
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss, reason = "small test index")]
+                let x = (i % 7) as f32 * 0.125 - 0.35;
+                x
+            })
+            .collect();
+
+        for (quant, bytes) in [(QuantType::Q4_0, q4_bytes), (QuantType::Q8_0, q8_bytes)] {
+            let view =
+                TensorView::from_bytes("blk.0.test.weight", quant, &[32, 2], 0, &bytes).unwrap();
+            let cached = DoryCachedWeight::from_tensor_view(&view, 2, 32).unwrap();
+            assert_eq!(cached.payload_ptr().align_offset(128), 0);
+            assert_eq!(cached.rows(), 2);
+            assert_eq!(cached.cols(), 32);
+            assert_eq!(cached.quant(), quant);
+
+            let expected = project_linear(&view, &input, 2).unwrap();
+            let mut actual = [0.0_f32; 2];
+            cached.project_f32(&mut actual, &input).unwrap();
+            // Repacked RVV kernels quantize dynamic activations to Q8 (<= ~1% relative step error);
+            // scalar fallback is bit-exact against project_linear.
+            for (e, a) in expected.iter().zip(actual.iter()) {
+                let tol = if cfg!(feature = "with-kernels") {
+                    0.015 * e.abs().max(1.0)
+                } else {
+                    1e-5
+                };
+                assert!((e - a).abs() < tol, "{quant}: expected {e}, got {a}");
+            }
+
+            #[cfg(feature = "with-kernels")]
+            {
+                let mut rep_row = [0.0_f32; 32];
+                let mut oracle_row = [0.0_f32; 32];
+                cached.repacked().dequantize_row(0, &mut rep_row).unwrap();
+                quant::dequantize_row_to_f32(&view, 0, 32, &mut oracle_row).unwrap();
+                assert_eq!(rep_row, oracle_row);
+            }
+
+            let mut prefix = [0.0_f32; 1];
+            cached.project_prefix_f32(&mut prefix, &input).unwrap();
+            assert!((actual[0] - prefix[0]).abs() < 1e-6);
+        }
     }
 }
