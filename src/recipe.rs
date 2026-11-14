@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, TensorView,
+    ModelMetadata, ModelWeights, QuantType, ScratchScope, ScratchWorkspace, TensorView,
 };
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    AttentionMaskConfig, gqa_causal_attention_prefill_f32, l2_norm_f32_in_place,
-    ngpt_residual_lerp_in_place,
+    AttentionMaskConfig, QuantizedActQ8View, RopeType, apply_rope_with_cos_sin,
+    compute_rope_cos_sin, gqa_causal_attention_prefill_f32, gqa_causal_attention_with_scratch_f32,
+    l2_norm_f32_in_place, ngpt_residual_lerp_in_place,
 };
 
 use crate::physical_cache::{
@@ -330,6 +331,8 @@ pub struct DoryRecipe {
     pub stop_metadata: DoryStopMetadata,
     /// Optional pre-repacked physical sub-layer weight and scale cache shared across inference steps.
     physical_cache: Option<Arc<DoryPhysicalCache>>,
+    /// Optional explicit output-row worker partition override (`None` tracks active Rayon pool).
+    worker_partitions: Option<usize>,
 }
 
 impl PartialEq for DoryRecipe {
@@ -391,6 +394,7 @@ impl DoryRecipe {
             logit_scale: None,
             stop_metadata: DoryStopMetadata::new(),
             physical_cache: None,
+            worker_partitions: None,
         }
     }
 
@@ -451,6 +455,31 @@ impl DoryRecipe {
     /// Detaches any cached physical sub-layer weights from this recipe.
     pub fn clear_physical_cache(&mut self) {
         self.physical_cache = None;
+    }
+
+    /// Sets an explicit output-row worker partition count for parallel `M = 1` GEMV (`None`
+    /// uses [`rayon::current_num_threads`]).
+    #[must_use]
+    pub const fn with_worker_partitions(mut self, workers: Option<usize>) -> Self {
+        self.worker_partitions = workers;
+        self
+    }
+
+    /// Returns the configured worker partition override, if any.
+    #[must_use]
+    pub const fn worker_partitions(&self) -> Option<usize> {
+        self.worker_partitions
+    }
+
+    /// Returns the `128-byte`-aligned [`jero_core::ScratchWorkspace`] byte capacity required for a
+    /// zero-allocation [`ArchRecipe::decode_step`] pass up to `n_ctx` context tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if hyperparameters are invalid or scratch byte calculation overflows.
+    pub fn decode_scratch_bytes(&self, n_ctx: usize) -> Result<usize, K3Error> {
+        self.validate_hyperparams()?;
+        Ok(dory_decode_scratch_layout(self, n_ctx.max(1))?.total_bytes)
     }
 
     /// Parses `dory.rope.profile` across string, unsigned/non-negative signed integer (`u32`/`i32`),
@@ -750,17 +779,16 @@ impl DoryRecipe {
                 reason: "dory physical layer count must be non-zero".to_owned(),
             });
         }
-        let pattern_chars: Vec<char> = self.layer_pattern.chars().collect();
-        if pattern_chars.len() < physical {
+        let count = self.layer_pattern.chars().count();
+        if count < physical {
             return Err(K3Error::CapabilityMismatch {
                 architecture: "dory".to_owned(),
                 reason: format!(
-                    "dory.layer_pattern length ({}) is shorter than physical layer count ({physical})",
-                    pattern_chars.len()
+                    "dory.layer_pattern length ({count}) is shorter than physical layer count ({physical})"
                 ),
             });
         }
-        for (p, &ch) in pattern_chars.iter().take(physical).enumerate() {
+        for (p, ch) in self.layer_pattern.chars().take(physical).enumerate() {
             DorySubLayerKind::from_pattern_char(ch).map_err(|_| K3Error::CapabilityMismatch {
                 architecture: "dory".to_owned(),
                 reason: format!(
@@ -1074,13 +1102,21 @@ impl DoryRecipe {
         };
 
         let resolved = self.resolve_execution_cache(explicit_cache, weights)?;
-        self.execute_dory_schedule_with_cache(
+        let req = self.decode_scratch_bytes(pos + 1)?;
+        let mut ws = ScratchWorkspace::new(req)?;
+        let mut out = vec![0.0_f32; (self.hidden_dim as usize).max(2)];
+        let workers = quant::effective_worker_count(self.worker_partitions);
+        self.run_decode_schedule_into(
             token_id,
             pos,
             kv_view.as_mut(),
             resolved.as_ref().map(ResolvedCache::as_ref),
             weights,
-        )
+            &mut ws,
+            workers,
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     fn resolve_execution_cache<'a>(
@@ -1097,9 +1133,9 @@ impl DoryRecipe {
         if weights.tensor_count() == 0 {
             return Ok(None);
         }
-        Ok(Some(ResolvedCache::Owned(DoryPhysicalCache::build(
-            self, weights,
-        )?)))
+        Ok(Some(ResolvedCache::Owned(Box::new(
+            DoryPhysicalCache::build(self, weights)?,
+        ))))
     }
 
     fn prefill_step_inner(
@@ -1158,13 +1194,7 @@ impl DoryRecipe {
         )?;
 
         if compute_logits {
-            populate_dory_logits(
-                self,
-                &last_hidden,
-                logits_buf,
-                weights,
-                cache_ref.and_then(DoryPhysicalCache::output_scale),
-            )?;
+            populate_dory_logits(self, &last_hidden, logits_buf, weights, cache_ref)?;
         }
         ctx.advance_position(tokens.len())?;
         Ok(())
@@ -1193,38 +1223,79 @@ impl DoryRecipe {
 
         let resolved = self.resolve_execution_cache(explicit_cache, weights)?;
         let cache_ref = resolved.as_ref().map(ResolvedCache::as_ref);
+        let geom = (self.attention_kv_layer_count()? > 0)
+            .then(|| self.kv_geometry(n_ctx))
+            .transpose()?;
+        let required_scratch = self.decode_scratch_bytes(pos + 1)?;
+        let (logits_buf, kv_buf, scratch_opt) = ctx.buffers_and_scratch_mut();
+        let mut owned_scratch = None;
+        let active_scratch =
+            resolve_decode_scratch(required_scratch, scratch_opt, &mut owned_scratch)?;
+        let mut kv_view = resolve_decode_kv_view(geom, kv_buf, weights)?;
 
-        let num_kv_slots = self.attention_kv_layer_count()?;
-        let (logits_buf, kv_buf) = ctx.buffers_mut();
-        let mut kv_view = if num_kv_slots > 0 {
-            let geom = self.kv_geometry(n_ctx)?;
-            if weights.tensor_count() > 0 {
-                Some(KvCacheView::new(kv_buf, geom)?)
-            } else {
-                KvCacheView::new(kv_buf, geom).ok()
-            }
-        } else {
-            None
-        };
+        let hidden_dim = (self.hidden_dim as usize).max(2);
+        let head_dim = (self.head_dim as usize).max(2);
+        let half_head_dim = (head_dim / 2).max(1);
+        let workers = quant::effective_worker_count(self.worker_partitions);
 
-        let hidden = self.execute_dory_schedule_with_cache(
-            token_id,
-            pos,
-            kv_view.as_mut(),
-            cache_ref,
-            weights,
-        )?;
-        populate_dory_logits(
-            self,
-            &hidden,
-            logits_buf,
-            weights,
-            cache_ref.and_then(DoryPhysicalCache::output_scale),
-        )?;
+        with_dory_decode_state(hidden_dim, half_head_dim, active_scratch, |state, arena| {
+            self.execute_dory_schedule_with_cache(
+                token_id,
+                pos,
+                kv_view.as_mut(),
+                cache_ref,
+                weights,
+                state,
+                arena,
+                workers,
+            )?;
+            arena.run_scoped(|scope| {
+                let q8_0_bytes = quant::q8_0_scratch_bytes(hidden_dim);
+                let act_q8_0 = if q8_0_bytes > 0 {
+                    scope.alloc_u8(q8_0_bytes)?
+                } else {
+                    &mut []
+                };
+                populate_dory_logits_with_scratch(
+                    self, state.cur, logits_buf, weights, cache_ref, act_q8_0, workers,
+                )
+            })
+        })?;
         ctx.advance_position(1)?;
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "standalone final hidden runner copies final state into caller buffer"
+    )]
+    fn run_decode_schedule_into(
+        &self,
+        token_id: u32,
+        pos: usize,
+        kv_view: Option<&mut KvCacheView<'_>>,
+        cache: Option<&DoryPhysicalCache>,
+        weights: &dyn ModelWeights,
+        ws: &mut ScratchWorkspace,
+        workers: usize,
+        out: &mut [f32],
+    ) -> Result<(), K3Error> {
+        let hidden_dim = (self.hidden_dim as usize).max(2);
+        let head_dim = (self.head_dim as usize).max(2);
+        let half_head_dim = (head_dim / 2).max(1);
+        with_dory_decode_state(hidden_dim, half_head_dim, ws, |state, arena| {
+            self.execute_dory_schedule_with_cache(
+                token_id, pos, kv_view, cache, weights, state, arena, workers,
+            )?;
+            out.copy_from_slice(state.cur);
+            Ok(())
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "full single-token decode schedule passes KV cache, physical cache, persistent state, scratch arena, and worker count"
+    )]
     fn execute_dory_schedule_with_cache(
         &self,
         token_id: u32,
@@ -1232,73 +1303,101 @@ impl DoryRecipe {
         mut kv_view: Option<&mut KvCacheView<'_>>,
         cache: Option<&DoryPhysicalCache>,
         weights: &dyn ModelWeights,
-    ) -> Result<Vec<f32>, K3Error> {
-        let hidden_dim = (self.hidden_dim as usize).max(2);
-        let mut cur = match weights.tensor("token_embd.weight") {
-            Ok(embd) => extract_token_embedding(&embd, token_id, hidden_dim)?,
+        state: &mut DoryDecodeState<'_>,
+        arena: &mut ScratchArena<'_, '_>,
+        workers: usize,
+    ) -> Result<(), K3Error> {
+        match weights.tensor("token_embd.weight") {
+            Ok(embd) => extract_token_embedding_into(&embd, token_id, state.cur)?,
             Err(err) => {
                 if weights.tensor_count() == 0 {
-                    synthetic_unit_embedding(token_id, hidden_dim)
+                    synthetic_unit_embedding_into(token_id, state.cur);
                 } else {
                     return Err(err);
                 }
             }
-        };
-        l2_normalize_in_place(&mut cur, DORY_L2_EPS);
+        }
+        l2_normalize_in_place(state.cur, DORY_L2_EPS);
 
         let Some(physical_cache) = cache else {
-            return Ok(cur);
+            return Ok(());
         };
+
+        let head_dim = (self.head_dim as usize).max(2);
+        init_rope_cos_sin_from_inv_freq(
+            self,
+            pos,
+            head_dim,
+            Some(physical_cache.rope_inv_freq_full()),
+            state.cos_full,
+            state.sin_full,
+            self.rope_theta_full,
+        )?;
+        init_rope_cos_sin_from_inv_freq(
+            self,
+            pos,
+            head_dim,
+            Some(physical_cache.rope_inv_freq_swa()),
+            state.cos_swa,
+            state.sin_swa,
+            self.rope_theta_swa,
+        )?;
 
         let mut virtual_idx = 0_u32;
 
         // 1. Input Block (0 .. n_input_layers)
         self.execute_physical_range_cached(
-            &mut cur,
             0..self.n_input_layers,
             &mut virtual_idx,
             pos,
             kv_view.as_deref_mut(),
             physical_cache,
+            state,
+            arena,
+            workers,
         )?;
 
         // 2. Latch input_h = cur at il == n_input_layers
-        let input_h = cur.clone();
+        state.input_h.copy_from_slice(state.cur);
 
         // 3. Shared Recurrent Block (n_loops iterations of n_input_layers .. n_input_layers + n_recurrent_layers)
         let rec_end = self.n_input_layers + self.n_recurrent_layers;
         for _loop_idx in 0..self.n_loops {
             // Loop-entry input feature re-injection: cur = L2Norm(cur + input_h)
-            for (c, &inp) in cur.iter_mut().zip(input_h.iter()) {
+            for (c, &inp) in state.cur.iter_mut().zip(state.input_h.iter()) {
                 *c += inp;
             }
-            l2_normalize_in_place(&mut cur, DORY_L2_EPS);
+            l2_normalize_in_place(state.cur, DORY_L2_EPS);
 
             self.execute_physical_range_cached(
-                &mut cur,
                 self.n_input_layers..rec_end,
                 &mut virtual_idx,
                 pos,
                 kv_view.as_deref_mut(),
                 physical_cache,
+                state,
+                arena,
+                workers,
             )?;
 
             // Loop-exit normalization: cur = L2Norm(cur)
-            l2_normalize_in_place(&mut cur, DORY_L2_EPS);
+            l2_normalize_in_place(state.cur, DORY_L2_EPS);
         }
 
         // 4. Output Block (n_input_layers + n_recurrent_layers .. n_physical)
         let n_physical = self.physical_layer_count();
         self.execute_physical_range_cached(
-            &mut cur,
             rec_end..n_physical,
             &mut virtual_idx,
             pos,
             kv_view,
             physical_cache,
+            state,
+            arena,
+            workers,
         )?;
 
-        Ok(cur)
+        Ok(())
     }
 
     fn execute_dory_batched_prefill_with_cache(
@@ -1396,23 +1495,31 @@ impl DoryRecipe {
         Ok(cur[(m - 1) * hidden_dim..].to_vec())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "physical segment range passes sublayer range, KV cache, physical cache, persistent state, scratch arena, and worker count"
+    )]
     fn execute_physical_range_cached(
         &self,
-        cur: &mut [f32],
         phys_range: std::ops::Range<u32>,
         virtual_idx: &mut u32,
         pos: usize,
         mut kv_view: Option<&mut KvCacheView<'_>>,
         cache: &DoryPhysicalCache,
+        state: &mut DoryDecodeState<'_>,
+        arena: &mut ScratchArena<'_, '_>,
+        workers: usize,
     ) -> Result<(), K3Error> {
         for p in phys_range {
             self.execute_physical_sublayer_cached(
-                cur,
                 p,
                 *virtual_idx,
                 pos,
                 kv_view.as_deref_mut(),
                 cache,
+                state,
+                arena,
+                workers,
             )?;
             *virtual_idx += 1;
         }
@@ -1467,27 +1574,417 @@ impl DoryRecipe {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "sublayer dispatch passes physical/virtual index, position, KV view, physical cache, persistent state, scratch arena, and worker count"
+    )]
     fn execute_physical_sublayer_cached(
         &self,
-        cur: &mut [f32],
         physical_idx: u32,
         virtual_idx: u32,
         pos: usize,
         kv_view: Option<&mut KvCacheView<'_>>,
         cache: &DoryPhysicalCache,
+        state: &mut DoryDecodeState<'_>,
+        arena: &mut ScratchArena<'_, '_>,
+        workers: usize,
     ) -> Result<(), K3Error> {
         let sublayer = cache.get(physical_idx)?;
-        match sublayer {
-            DoryPhysicalSubLayer::Attention { attn_alpha, .. } => {
-                let (kv_slot, kv) =
-                    resolve_kv_slot_and_view(self, physical_idx, virtual_idx, kv_view)?;
-                let sub_out =
-                    run_dory_attention_cached_with_kv_view(self, cur, pos, kv_slot, kv, sublayer)?;
-                apply_ngpt_residual_update(cur, &sub_out, attn_alpha.as_slice())?;
+        let run_in_scope = |scope: &ScratchScope<'_>| -> Result<(), K3Error> {
+            let hidden_dim = state.cur.len();
+            match sublayer {
+                DoryPhysicalSubLayer::Attention { attn_alpha, .. } => {
+                    let (kv_slot, kv) =
+                        resolve_kv_slot_and_view(self, physical_idx, virtual_idx, kv_view)?;
+                    let sub_out = scope.alloc_f32(hidden_dim)?;
+                    let residual_scratch = scope.alloc_f32(hidden_dim)?;
+                    run_dory_attention_in_scope(
+                        self, pos, kv_slot, kv, sublayer, state, scope, sub_out, workers,
+                    )?;
+                    apply_ngpt_residual_update_with_scratch(
+                        state.cur,
+                        sub_out,
+                        attn_alpha.as_slice(),
+                        residual_scratch,
+                    )
+                }
+                DoryPhysicalSubLayer::Mlp { mlp_alpha, .. } => {
+                    let sub_out = scope.alloc_f32(hidden_dim)?;
+                    let residual_scratch = scope.alloc_f32(hidden_dim)?;
+                    run_dory_mlp_in_scope(self, sublayer, state.cur, scope, sub_out, workers)?;
+                    apply_ngpt_residual_update_with_scratch(
+                        state.cur,
+                        sub_out,
+                        mlp_alpha.as_slice(),
+                        residual_scratch,
+                    )
+                }
             }
-            DoryPhysicalSubLayer::Mlp { mlp_alpha, .. } => {
-                let sub_out = run_dory_mlp_cached(self, cur, sublayer)?;
-                apply_ngpt_residual_update(cur, &sub_out, mlp_alpha.as_slice())?;
+        };
+
+        arena.run_scoped(run_in_scope)
+    }
+}
+
+const STACK_CUR_HIDDEN_MAX: usize = 4096;
+const STACK_ROPE_HALF_MAX: usize = 512;
+
+enum ScratchArena<'a, 'b> {
+    Workspace(&'a mut ScratchWorkspace),
+    Scope(&'a ScratchScope<'b>),
+}
+
+impl ScratchArena<'_, '_> {
+    fn run_scoped<F, R>(&mut self, op: F) -> Result<R, K3Error>
+    where
+        F: FnOnce(&ScratchScope<'_>) -> Result<R, K3Error>,
+    {
+        match self {
+            Self::Workspace(ws) => {
+                // Rewind per-layer scratch at every virtual layer so peak capacity stays O(1) in n_loops.
+                let mut cp = ws.checkpoint();
+                let scope = cp.workspace().scope();
+                op(&scope)
+            }
+            Self::Scope(scope) => op(scope),
+        }
+    }
+}
+
+fn resolve_decode_scratch<'a>(
+    required_bytes: usize,
+    scratch_opt: Option<&'a mut ScratchWorkspace>,
+    owned_scratch: &'a mut Option<ScratchWorkspace>,
+) -> Result<&'a mut ScratchWorkspace, K3Error> {
+    let active = if let Some(ws) = scratch_opt {
+        ws
+    } else {
+        owned_scratch.insert(ScratchWorkspace::new(required_bytes)?)
+    };
+    if active.remaining_bytes() < required_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "dory_decode_scratch".to_owned(),
+            offset: active.used_bytes(),
+            byte_len: required_bytes,
+            buffer_len: active.remaining_bytes(),
+            reason: format!(
+                "ScratchWorkspace remaining {} bytes < required {required_bytes}",
+                active.remaining_bytes()
+            ),
+        });
+    }
+    Ok(active)
+}
+
+fn resolve_decode_kv_view<'a>(
+    geom: Option<KvGeometry>,
+    kv_buf: &'a mut [f32],
+    weights: &dyn ModelWeights,
+) -> Result<Option<KvCacheView<'a>>, K3Error> {
+    match geom {
+        Some(g) if weights.tensor_count() > 0 => Ok(Some(KvCacheView::new(kv_buf, g)?)),
+        Some(g) => Ok(KvCacheView::new(kv_buf, g).ok()),
+        None => Ok(None),
+    }
+}
+
+fn with_dory_decode_state<F>(
+    hidden_dim: usize,
+    half_head_dim: usize,
+    ws: &mut ScratchWorkspace,
+    op: F,
+) -> Result<(), K3Error>
+where
+    F: FnOnce(&mut DoryDecodeState<'_>, &mut ScratchArena<'_, '_>) -> Result<(), K3Error>,
+{
+    if hidden_dim <= STACK_CUR_HIDDEN_MAX && half_head_dim <= STACK_ROPE_HALF_MAX {
+        let mut cur_buf = [0.0_f32; STACK_CUR_HIDDEN_MAX];
+        let mut input_h_buf = [0.0_f32; STACK_CUR_HIDDEN_MAX];
+        let mut cos_full_buf = [0.0_f32; STACK_ROPE_HALF_MAX];
+        let mut sin_full_buf = [0.0_f32; STACK_ROPE_HALF_MAX];
+        let mut cos_swa_buf = [0.0_f32; STACK_ROPE_HALF_MAX];
+        let mut sin_swa_buf = [0.0_f32; STACK_ROPE_HALF_MAX];
+        let mut state = DoryDecodeState {
+            cur: &mut cur_buf[..hidden_dim],
+            input_h: &mut input_h_buf[..hidden_dim],
+            cos_full: &mut cos_full_buf[..half_head_dim],
+            sin_full: &mut sin_full_buf[..half_head_dim],
+            cos_swa: &mut cos_swa_buf[..half_head_dim],
+            sin_swa: &mut sin_swa_buf[..half_head_dim],
+        };
+        let mut arena = ScratchArena::Workspace(ws);
+        op(&mut state, &mut arena)
+    } else {
+        let scope = ws.scope();
+        let mut state = DoryDecodeState {
+            cur: scope.alloc_f32(hidden_dim)?,
+            input_h: scope.alloc_f32(hidden_dim)?,
+            cos_full: scope.alloc_f32(half_head_dim)?,
+            sin_full: scope.alloc_f32(half_head_dim)?,
+            cos_swa: scope.alloc_f32(half_head_dim)?,
+            sin_swa: scope.alloc_f32(half_head_dim)?,
+        };
+        let mut arena = ScratchArena::Scope(&scope);
+        op(&mut state, &mut arena)
+    }
+}
+
+struct DoryDecodeState<'a> {
+    cur: &'a mut [f32],
+    input_h: &'a mut [f32],
+    cos_full: &'a mut [f32],
+    sin_full: &'a mut [f32],
+    cos_swa: &'a mut [f32],
+    sin_swa: &'a mut [f32],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoryScratchLayout {
+    total_bytes: usize,
+}
+
+fn align_scratch_slot_bytes(bytes: usize) -> Result<usize, K3Error> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let rem = bytes % 128;
+    if rem == 0 {
+        Ok(bytes)
+    } else {
+        bytes
+            .checked_add(128 - rem)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "dory_decode_scratch".to_owned(),
+                offset: 0,
+                byte_len: bytes,
+                buffer_len: usize::MAX,
+                reason: "scratch slot alignment overflow".to_owned(),
+            })
+    }
+}
+
+fn scratch_f32_bytes(elems: usize) -> Result<usize, K3Error> {
+    let raw = elems
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "dory_decode_scratch".to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: 0,
+            reason: "decode scratch byte size overflow".to_owned(),
+        })?;
+    align_scratch_slot_bytes(raw)
+}
+
+#[cfg_attr(
+    not(feature = "with-kernels"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "with-kernels feature branch computes checked Q8 view scratch alignment"
+    )
+)]
+fn scratch_act_view_bytes(cols: usize) -> Result<usize, K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        align_scratch_slot_bytes(QuantizedActQ8View::scratch_bytes_for_row(cols))
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let _ = cols;
+        Ok(0)
+    }
+}
+
+fn dory_decode_scratch_overflow(reason: &str) -> K3Error {
+    K3Error::TensorBoundsError {
+        tensor_name: "dory_decode_scratch".to_owned(),
+        offset: 0,
+        byte_len: usize::MAX,
+        buffer_len: 0,
+        reason: reason.to_owned(),
+    }
+}
+
+fn sum_scratch_terms(terms: &[usize], overflow_reason: &str) -> Result<usize, K3Error> {
+    terms
+        .iter()
+        .try_fold(0_usize, |acc, &x| acc.checked_add(x))
+        .ok_or_else(|| dory_decode_scratch_overflow(overflow_reason))
+}
+
+fn dory_decode_scratch_layout(
+    recipe: &DoryRecipe,
+    scores_len: usize,
+) -> Result<DoryScratchLayout, K3Error> {
+    let hidden_dim = (recipe.hidden_dim as usize).max(2);
+    let num_heads = (recipe.num_heads as usize).max(1);
+    let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let q_dim = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: "q_dim overflow in scratch calculation".to_owned(),
+        })?;
+    let kv_dim = num_kv_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: "kv_dim overflow in scratch calculation".to_owned(),
+        })?;
+    let ffn_dim = (recipe.ffn_dim as usize).max(1);
+    let half_head_dim = (head_dim / 2).max(1);
+    let scores_len = scores_len.max(1);
+
+    let attn_layer_bytes = sum_scratch_terms(
+        &[
+            scratch_f32_bytes(q_dim)?,
+            scratch_f32_bytes(kv_dim)?,
+            scratch_f32_bytes(kv_dim)?,
+            scratch_f32_bytes(q_dim)?,
+            scratch_f32_bytes(q_dim)?,
+            scratch_f32_bytes(hidden_dim)?,
+            scratch_f32_bytes(hidden_dim)?,
+            scratch_f32_bytes(scores_len)?,
+            scratch_act_view_bytes(hidden_dim)?,
+            scratch_act_view_bytes(q_dim)?,
+        ],
+        "attention decode scratch byte overflow",
+    )?;
+    let mlp_layer_bytes = sum_scratch_terms(
+        &[
+            scratch_f32_bytes(ffn_dim)?,
+            scratch_f32_bytes(ffn_dim)?,
+            scratch_f32_bytes(ffn_dim)?,
+            scratch_f32_bytes(hidden_dim)?,
+            scratch_f32_bytes(hidden_dim)?,
+            scratch_act_view_bytes(hidden_dim)?,
+            scratch_act_view_bytes(ffn_dim)?,
+        ],
+        "mlp decode scratch byte overflow",
+    )?;
+    let lm_bytes = align_scratch_slot_bytes(quant::q8_0_scratch_bytes(hidden_dim))?;
+    let per_layer_max = attn_layer_bytes.max(mlp_layer_bytes);
+
+    let total_bytes = if hidden_dim <= STACK_CUR_HIDDEN_MAX && half_head_dim <= STACK_ROPE_HALF_MAX
+    {
+        per_layer_max.max(lm_bytes)
+    } else {
+        let persistent_bytes = scratch_f32_bytes(hidden_dim)?
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(scratch_f32_bytes(half_head_dim).ok()?.checked_mul(4)?))
+            .ok_or_else(|| dory_decode_scratch_overflow("persistent decode scratch overflow"))?;
+        let n_virtual = (recipe.virtual_layer_count() as usize).max(1);
+        let layered = per_layer_max
+            .checked_mul(n_virtual)
+            .ok_or_else(|| dory_decode_scratch_overflow("unbounded scope scratch overflow"))?;
+        sum_scratch_terms(
+            &[persistent_bytes, layered, lm_bytes],
+            "decode scratch total capacity overflow",
+        )?
+    };
+
+    Ok(DoryScratchLayout { total_bytes })
+}
+
+fn init_rope_cos_sin_from_inv_freq(
+    recipe: &DoryRecipe,
+    pos: usize,
+    head_dim: usize,
+    inv_freq: Option<&[f32]>,
+    cos_out: &mut [f32],
+    sin_out: &mut [f32],
+    theta: f32,
+) -> Result<(), K3Error> {
+    let _ = recipe;
+    let half = head_dim / 2;
+    if half == 0
+        || cos_out.len() != half
+        || sin_out.len() != half
+        || inv_freq.is_some_and(|t| t.len() != half)
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "dory_rope_cos_sin".to_owned(),
+            offset: 0,
+            byte_len: cos_out.len(),
+            buffer_len: half,
+            reason: format!(
+                "invalid Dory RoPE scratch table lengths: half={half}, inv_freq={:?}, cos={}, sin={}",
+                inv_freq.map(<[f32]>::len),
+                cos_out.len(),
+                sin_out.len()
+            ),
+        });
+    }
+    #[cfg(feature = "with-kernels")]
+    {
+        compute_rope_cos_sin(pos, theta, 1.0, inv_freq, cos_out, sin_out)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "context position and dimension indices fit f32 cleanly"
+        )]
+        let pos_f = pos as f32;
+        if let Some(freqs) = inv_freq {
+            for (idx, &freq) in freqs.iter().enumerate() {
+                let angle = pos_f * freq;
+                let (s, c) = angle.sin_cos();
+                sin_out[idx] = s;
+                cos_out[idx] = c;
+            }
+        } else {
+            #[expect(clippy::cast_precision_loss, reason = "head_dim fits f32")]
+            let denom = head_dim as f32;
+            for idx in 0..half {
+                #[expect(clippy::cast_precision_loss, reason = "pair index fits f32")]
+                let exp = (2 * idx) as f32 / denom;
+                let angle = pos_f / theta.powf(exp);
+                let (s, c) = angle.sin_cos();
+                sin_out[idx] = s;
+                cos_out[idx] = c;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn apply_neox_rope_with_cos_sin(
+    vec: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<(), K3Error> {
+    let half = head_dim / 2;
+    if half == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "with-kernels")]
+    {
+        apply_rope_with_cos_sin(vec, num_heads, head_dim, head_dim, RopeType::NeoX, cos, sin)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        if cos.len() != half || sin.len() != half || vec.len() < num_heads * head_dim {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "dory_rope".to_owned(),
+                offset: 0,
+                byte_len: vec.len(),
+                buffer_len: num_heads * head_dim,
+                reason: "Dory scalar RoPE cos/sin length mismatch".to_owned(),
+            });
+        }
+        for h in 0..num_heads {
+            let head = &mut vec[h * head_dim..(h + 1) * head_dim];
+            for i in 0..half {
+                let x0 = head[i];
+                let x1 = head[i + half];
+                let cos_a = cos[i];
+                let sin_a = sin[i];
+                head[i] = x0 * cos_a - x1 * sin_a;
+                head[i + half] = x0 * sin_a + x1 * cos_a;
             }
         }
         Ok(())
@@ -1603,14 +2100,14 @@ fn l2_normalize_rows_in_place(matrix: &mut [f32], row_width: usize, eps: f32) {
 
 enum ResolvedCache<'a> {
     Borrowed(&'a DoryPhysicalCache),
-    Owned(DoryPhysicalCache),
+    Owned(Box<DoryPhysicalCache>),
 }
 
 impl ResolvedCache<'_> {
-    const fn as_ref(&self) -> &DoryPhysicalCache {
+    fn as_ref(&self) -> &DoryPhysicalCache {
         match self {
             Self::Borrowed(cache) => cache,
-            Self::Owned(cache) => cache,
+            Self::Owned(cache) => cache.as_ref(),
         }
     }
 }
@@ -1772,10 +2269,6 @@ pub fn run_dory_attention_sublayer(
     run_dory_attention_cached_with_kv_view(recipe, cur, pos, cache_layer, &mut kv_view, &sublayer)
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "head dimensions fit cleanly in f32"
-)]
 fn run_dory_attention_cached_with_kv_view(
     recipe: &DoryRecipe,
     cur: &[f32],
@@ -1784,6 +2277,85 @@ fn run_dory_attention_cached_with_kv_view(
     kv_view: &mut KvCacheView<'_>,
     sublayer: &DoryPhysicalSubLayer,
 ) -> Result<Vec<f32>, K3Error> {
+    let hidden_dim = (recipe.hidden_dim as usize).max(2);
+    if cur.len() != hidden_dim {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "cur".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(cur),
+            buffer_len: hidden_dim,
+            reason: format!(
+                "Dory attention input len {} does not match hidden_dim {hidden_dim}",
+                cur.len()
+            ),
+        });
+    }
+    let req = recipe.decode_scratch_bytes(pos + 1)?;
+    let mut ws = ScratchWorkspace::new(req)?;
+    let scope = ws.scope();
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let half = (head_dim / 2).max(1);
+    let mut cos_full = vec![0.0_f32; half];
+    let mut sin_full = vec![0.0_f32; half];
+    let mut cos_swa = vec![0.0_f32; half];
+    let mut sin_swa = vec![0.0_f32; half];
+    init_rope_cos_sin_from_inv_freq(
+        recipe,
+        pos,
+        head_dim,
+        None,
+        &mut cos_full,
+        &mut sin_full,
+        recipe.rope_theta_full,
+    )?;
+    init_rope_cos_sin_from_inv_freq(
+        recipe,
+        pos,
+        head_dim,
+        None,
+        &mut cos_swa,
+        &mut sin_swa,
+        recipe.rope_theta_swa,
+    )?;
+    let mut cur_copy = cur.to_vec();
+    let mut dummy_inp = [];
+    let state = DoryDecodeState {
+        cur: &mut cur_copy,
+        input_h: &mut dummy_inp,
+        cos_full: &mut cos_full,
+        sin_full: &mut sin_full,
+        cos_swa: &mut cos_swa,
+        sin_swa: &mut sin_swa,
+    };
+    let sub_out = scope.alloc_f32(hidden_dim)?;
+    let workers = quant::effective_worker_count(recipe.worker_partitions);
+    run_dory_attention_in_scope(
+        recipe, pos, kv_slot, kv_view, sublayer, &state, &scope, sub_out, workers,
+    )?;
+    Ok(sub_out.to_vec())
+}
+
+struct DoryProjectedQkv<'a> {
+    q: &'a mut [f32],
+    k: &'a mut [f32],
+    v: &'a mut [f32],
+    gate: &'a mut [f32],
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "zero-alloc attention QKV projection, dual-theta RoPE, and QK L2 norm helper"
+)]
+fn project_and_norm_attention_qkv(
+    recipe: &DoryRecipe,
+    sublayer: &DoryPhysicalSubLayer,
+    state: &DoryDecodeState<'_>,
+    scope: &ScratchScope<'_>,
+    projected: &mut DoryProjectedQkv<'_>,
+    sqrt_head_dim: f32,
+    init_std: f32,
+    workers: usize,
+) -> Result<(), K3Error> {
     let DoryPhysicalSubLayer::Attention {
         physical_idx,
         kind,
@@ -1791,7 +2363,6 @@ fn run_dory_attention_cached_with_kv_view(
         wk,
         wv,
         wgate,
-        wo,
         sqk,
         attn_gate,
         ..
@@ -1806,42 +2377,45 @@ fn run_dory_attention_cached_with_kv_view(
         });
     };
 
-    let hidden_dim = cur.len();
     let num_heads = (recipe.num_heads as usize).max(1);
     let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
     let head_dim = (recipe.head_dim as usize).max(2);
     let q_dim = num_heads * head_dim;
-    let kv_dim = num_kv_heads * head_dim;
-
     validate_attention_scales(*physical_idx, sqk.len(), attn_gate.len(), q_dim)?;
 
-    let mut q = vec![0.0_f32; q_dim];
-    let mut k = vec![0.0_f32; kv_dim];
-    let mut v = vec![0.0_f32; kv_dim];
-    let mut gate = vec![0.0_f32; q_dim];
-    wq.project_f32(&mut q, cur)?;
-    wk.project_f32(&mut k, cur)?;
-    wv.project_f32(&mut v, cur)?;
-    wgate.project_f32(&mut gate, cur)?;
+    // Quantize `cur` once for Wq, Wk, Wv, and Wgate with zero heap allocations.
+    #[cfg(feature = "with-kernels")]
+    {
+        let act = QuantizedActQ8View::quantize_row_in_scope(state.cur, scope)?;
+        wq.project_m1_repacked(projected.q, &act, workers)?;
+        wk.project_m1_repacked(projected.k, &act, workers)?;
+        wv.project_m1_repacked(projected.v, &act, workers)?;
+        wgate.project_m1_repacked(projected.gate, &act, workers)?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let _ = scope;
+        let act = quant::M1Activation::f32_only(state.cur);
+        wq.project_m1_prequantized(projected.q, &act, workers)?;
+        wk.project_m1_prequantized(projected.k, &act, workers)?;
+        wv.project_m1_prequantized(projected.v, &act, workers)?;
+        wgate.project_m1_prequantized(projected.gate, &act, workers)?;
+    }
 
-    // Dual-theta NeoX RoPE (profile 1 '*'/g -> rope_theta_full = 10M, profile 2 'S' -> rope_theta_swa = 10K)
-    let theta = if *kind == DorySubLayerKind::FullAttention {
-        recipe.rope_theta_full
+    // Dual-theta NeoX RoPE from precomputed token cos/sin tables (`FullAttention` -> 10M, `SWA` -> 10K)
+    let (cos, sin) = if *kind == DorySubLayerKind::FullAttention {
+        (&*state.cos_full, &*state.sin_full)
     } else {
-        recipe.rope_theta_swa
+        (&*state.cos_swa, &*state.sin_swa)
     };
-    apply_neox_rope(&mut q, num_heads, head_dim, pos, theta);
-    apply_neox_rope(&mut k, num_kv_heads, head_dim, pos, theta);
+    apply_neox_rope_with_cos_sin(projected.q, num_heads, head_dim, cos, sin)?;
+    apply_neox_rope_with_cos_sin(projected.k, num_kv_heads, head_dim, cos, sin)?;
 
-    // Per-head L2 normalization of Q and K followed by learned sqk scaling
-    let qk_scale = sqk.as_slice();
-    let init_std = recipe.init_std.max(1e-6);
-    let sqrt_head_dim = (head_dim as f32).sqrt();
     let kv_group_size = (num_heads / num_kv_heads).max(1);
     apply_qk_head_norm_and_sqk(
-        &mut q,
-        &mut k,
-        qk_scale,
+        projected.q,
+        projected.k,
+        sqk.as_slice(),
         num_heads,
         num_kv_heads,
         head_dim,
@@ -1849,38 +2423,158 @@ fn run_dory_attention_cached_with_kv_view(
         sqrt_head_dim,
         init_std,
     );
+    Ok(())
+}
 
-    // Write K and V into compact attention-only KvCacheView (fails closed on overflow/OOB)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "writes K/V into KV view and computes causal SWA/Full GQA window using scratch"
+)]
+fn attend_kv_window_in_scope(
+    recipe: &DoryRecipe,
+    pos: usize,
+    kv_slot: usize,
+    kind: DorySubLayerKind,
+    kv_view: &mut KvCacheView<'_>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attn_heads_out: &mut [f32],
+    scores_scratch: &mut [f32],
+    attn_scale: f32,
+) -> Result<(), K3Error> {
+    let num_heads = (recipe.num_heads as usize).max(1);
+    let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let kv_dim = num_kv_heads * head_dim;
+
     {
         let (key_dst, val_dst) = kv_view.write_pos_range(kv_slot, pos)?;
-        key_dst.copy_from_slice(&k);
-        val_dst.copy_from_slice(&v);
+        key_dst.copy_from_slice(k);
+        val_dst.copy_from_slice(v);
     }
 
     let (k_plane, v_plane) = kv_view.layer_kv(kv_slot)?;
-    let sliding_window = (*kind == DorySubLayerKind::SlidingAttention)
+    let valid_end = pos + 1;
+    let sliding_window = (kind == DorySubLayerKind::SlidingAttention)
         .then(|| (recipe.sliding_window as usize).max(1));
-    let attn_scale = sqrt_head_dim;
-    let mut attn_heads_out = vec![0.0_f32; q_dim];
-    let mut scores_scratch = vec![0.0_f32; pos + 1];
-    accumulate_causal_gqa_row(
-        &mut attn_heads_out,
-        &q,
-        k_plane,
-        v_plane,
+    let window_start = sliding_window.map_or(0, |swa| valid_end.saturating_sub(swa));
+    let win_len = valid_end - window_start;
+
+    #[cfg(feature = "with-kernels")]
+    {
+        gqa_causal_attention_with_scratch_f32(
+            attn_heads_out,
+            q,
+            &k_plane[window_start * kv_dim..valid_end * kv_dim],
+            &v_plane[window_start * kv_dim..valid_end * kv_dim],
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            win_len,
+            attn_scale,
+            &mut scores_scratch[..win_len],
+        )?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let kv_group_size = (num_heads / num_kv_heads).max(1);
+        let _ = win_len;
+        accumulate_causal_gqa_row(
+            attn_heads_out,
+            q,
+            k_plane,
+            v_plane,
+            pos,
+            num_heads,
+            kv_group_size,
+            head_dim,
+            kv_dim,
+            sliding_window,
+            attn_scale,
+            scores_scratch,
+        );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "zero-alloc attention passes scope arena and persistent RoPE tables"
+)]
+fn run_dory_attention_in_scope(
+    recipe: &DoryRecipe,
+    pos: usize,
+    kv_slot: usize,
+    kv_view: &mut KvCacheView<'_>,
+    sublayer: &DoryPhysicalSubLayer,
+    state: &DoryDecodeState<'_>,
+    scope: &ScratchScope<'_>,
+    sub_out: &mut [f32],
+    workers: usize,
+) -> Result<(), K3Error> {
+    let DoryPhysicalSubLayer::Attention {
+        kind,
+        wo,
+        attn_gate,
+        ..
+    } = sublayer
+    else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "dory".to_owned(),
+            reason: format!(
+                "expected Attention physical sublayer at {}, found Mlp",
+                sublayer.physical_idx()
+            ),
+        });
+    };
+
+    let num_heads = (recipe.num_heads as usize).max(1);
+    let num_kv_heads = (recipe.num_kv_heads as usize).max(1).min(num_heads);
+    let head_dim = (recipe.head_dim as usize).max(2);
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
+    let sqrt_head_dim = (head_dim as f32).sqrt();
+    let init_std = recipe.init_std.max(1e-6);
+
+    let mut projected = DoryProjectedQkv {
+        q: scope.alloc_f32(q_dim)?,
+        k: scope.alloc_f32(kv_dim)?,
+        v: scope.alloc_f32(kv_dim)?,
+        gate: scope.alloc_f32(q_dim)?,
+    };
+    let attn_heads_out = scope.alloc_f32(q_dim)?;
+    let scores_scratch = scope.alloc_f32((pos + 1).max(1))?;
+
+    project_and_norm_attention_qkv(
+        recipe,
+        sublayer,
+        state,
+        scope,
+        &mut projected,
+        sqrt_head_dim,
+        init_std,
+        workers,
+    )?;
+
+    attend_kv_window_in_scope(
+        recipe,
         pos,
-        num_heads,
-        kv_group_size,
-        head_dim,
-        kv_dim,
-        sliding_window,
-        attn_scale,
-        &mut scores_scratch,
-    );
+        kv_slot,
+        *kind,
+        kv_view,
+        projected.q,
+        projected.k,
+        projected.v,
+        attn_heads_out,
+        scores_scratch,
+        sqrt_head_dim,
+    )?;
 
     apply_attention_sigmoid_gate_and_norm(
-        &mut attn_heads_out,
-        &gate,
+        attn_heads_out,
+        projected.gate,
         attn_gate.as_slice(),
         1,
         q_dim,
@@ -1888,10 +2582,18 @@ fn run_dory_attention_cached_with_kv_view(
         init_std,
     );
 
-    let mut sub_out = vec![0.0_f32; hidden_dim];
-    wo.project_f32(&mut sub_out, &attn_heads_out)?;
-    l2_normalize_in_place(&mut sub_out, DORY_L2_EPS);
-    Ok(sub_out)
+    #[cfg(feature = "with-kernels")]
+    {
+        let act_wo = QuantizedActQ8View::quantize_row_in_scope(attn_heads_out, scope)?;
+        wo.project_m1_repacked(sub_out, &act_wo, workers)?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let act_wo = quant::M1Activation::f32_only(attn_heads_out);
+        wo.project_m1_prequantized(sub_out, &act_wo, workers)?;
+    }
+    l2_normalize_in_place(sub_out, DORY_L2_EPS);
+    Ok(())
 }
 
 #[expect(
@@ -2207,6 +2909,7 @@ fn write_batched_kv_slice(
     Ok(())
 }
 
+#[cfg_attr(feature = "with-kernels", allow(dead_code))]
 #[expect(
     clippy::too_many_arguments,
     reason = "shared causal GQA single-row accumulation across KV plane"
@@ -2318,6 +3021,36 @@ fn run_dory_mlp_cached(
     cur: &[f32],
     sublayer: &DoryPhysicalSubLayer,
 ) -> Result<Vec<f32>, K3Error> {
+    let hidden_dim = (recipe.hidden_dim as usize).max(2);
+    if cur.len() != hidden_dim {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "cur".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(cur),
+            buffer_len: hidden_dim,
+            reason: format!(
+                "Dory MLP input len {} does not match hidden_dim {hidden_dim}",
+                cur.len()
+            ),
+        });
+    }
+    let req = recipe.decode_scratch_bytes(1)?;
+    let mut ws = ScratchWorkspace::new(req)?;
+    let scope = ws.scope();
+    let sub_out = scope.alloc_f32(hidden_dim)?;
+    let workers = quant::effective_worker_count(recipe.worker_partitions);
+    run_dory_mlp_in_scope(recipe, sublayer, cur, &scope, sub_out, workers)?;
+    Ok(sub_out.to_vec())
+}
+
+fn run_dory_mlp_in_scope(
+    recipe: &DoryRecipe,
+    sublayer: &DoryPhysicalSubLayer,
+    cur: &[f32],
+    scope: &ScratchScope<'_>,
+    sub_out: &mut [f32],
+    workers: usize,
+) -> Result<(), K3Error> {
     let DoryPhysicalSubLayer::Mlp {
         physical_idx,
         wup,
@@ -2341,16 +3074,28 @@ fn run_dory_mlp_cached(
     let ffn_dim = (recipe.ffn_dim as usize).max(1);
     validate_mlp_scales(*physical_idx, suv.len(), mlp_gate.len(), ffn_dim)?;
 
-    let mut gate = vec![0.0_f32; ffn_dim];
-    let mut up = vec![0.0_f32; ffn_dim];
-    wgate.project_f32(&mut gate, cur)?;
-    wup.project_f32(&mut up, cur)?;
+    let gate = scope.alloc_f32(ffn_dim)?;
+    let up = scope.alloc_f32(ffn_dim)?;
+    let hidden_ffn = scope.alloc_f32(ffn_dim)?;
 
-    let mut hidden_ffn = vec![0.0_f32; ffn_dim];
+    // Quantize `cur` once for both Wgate and Wup with zero heap allocations.
+    #[cfg(feature = "with-kernels")]
+    {
+        let act = QuantizedActQ8View::quantize_row_in_scope(cur, scope)?;
+        wgate.project_m1_repacked(gate, &act, workers)?;
+        wup.project_m1_repacked(up, &act, workers)?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let act = quant::M1Activation::f32_only(cur);
+        wgate.project_m1_prequantized(gate, &act, workers)?;
+        wup.project_m1_prequantized(up, &act, workers)?;
+    }
+
     apply_mlp_swiglu_and_norm(
-        &mut hidden_ffn,
-        &gate,
-        &up,
+        hidden_ffn,
+        gate,
+        up,
         mlp_gate.as_slice(),
         suv.as_slice(),
         1,
@@ -2358,10 +3103,18 @@ fn run_dory_mlp_cached(
         hidden_dim,
     );
 
-    let mut sub_out = vec![0.0_f32; hidden_dim];
-    wdown.project_f32(&mut sub_out, &hidden_ffn)?;
-    l2_normalize_in_place(&mut sub_out, DORY_L2_EPS);
-    Ok(sub_out)
+    #[cfg(feature = "with-kernels")]
+    {
+        let act_down = QuantizedActQ8View::quantize_row_in_scope(hidden_ffn, scope)?;
+        wdown.project_m1_repacked(sub_out, &act_down, workers)?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let act_down = quant::M1Activation::f32_only(hidden_ffn);
+        wdown.project_m1_prequantized(sub_out, &act_down, workers)?;
+    }
+    l2_normalize_in_place(sub_out, DORY_L2_EPS);
+    Ok(())
 }
 
 fn validate_batched_input_len(
@@ -2542,8 +3295,7 @@ pub fn apply_neox_rope(vec: &mut [f32], num_heads: usize, head_dim: usize, pos: 
     }
 }
 
-fn synthetic_unit_embedding(token_id: u32, hidden_dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; hidden_dim];
+fn synthetic_unit_embedding_into(token_id: u32, out: &mut [f32]) {
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -2552,17 +3304,20 @@ fn synthetic_unit_embedding(token_id: u32, hidden_dim: usize) -> Vec<f32> {
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = (((token_id.wrapping_add(i as u32) % 19) as f32) + 1.0) * 0.1;
     }
+}
+
+fn synthetic_unit_embedding(token_id: u32, hidden_dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; hidden_dim];
+    synthetic_unit_embedding_into(token_id, &mut out);
     out
 }
 
-fn extract_token_embedding(
+fn extract_token_embedding_into(
     embd: &TensorView<'_>,
     token_id: u32,
-    hidden_dim: usize,
-) -> Result<Vec<f32>, K3Error> {
-    let mut out = vec![0.0_f32; hidden_dim];
-    quant::dequantize_row_to_f32(embd, token_id as usize, hidden_dim, &mut out)?;
-    Ok(out)
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    quant::dequantize_row_to_f32(embd, token_id as usize, out.len(), out)
 }
 
 /// Projects `input` through a 2D weight tensor (`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`, `Q8_0`,
@@ -2817,16 +3572,34 @@ fn validate_physical_layer_weights(
     Ok(())
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "hidden dimension fits cleanly in f32 scalar"
-)]
 fn populate_dory_logits(
     recipe: &DoryRecipe,
     hidden: &[f32],
     logits: &mut [f32],
     weights: &dyn ModelWeights,
-    output_scale: Option<&AlignedF32Vec>,
+    cache: Option<&DoryPhysicalCache>,
+) -> Result<(), K3Error> {
+    let q8_0_bytes = quant::q8_0_scratch_bytes(hidden.len());
+    let req = align_scratch_slot_bytes(q8_0_bytes)?;
+    let mut ws = ScratchWorkspace::new(req)?;
+    let scope = ws.scope();
+    let act_q8_0 = if q8_0_bytes > 0 {
+        scope.alloc_u8(q8_0_bytes)?
+    } else {
+        &mut []
+    };
+    let workers = quant::effective_worker_count(recipe.worker_partitions);
+    populate_dory_logits_with_scratch(recipe, hidden, logits, weights, cache, act_q8_0, workers)
+}
+
+fn populate_dory_logits_with_scratch(
+    recipe: &DoryRecipe,
+    hidden: &[f32],
+    logits: &mut [f32],
+    weights: &dyn ModelWeights,
+    cache: Option<&DoryPhysicalCache>,
+    act_q8_0: &mut [u8],
+    workers: usize,
 ) -> Result<(), K3Error> {
     if hidden.is_empty() {
         return Err(K3Error::CapabilityMismatch {
@@ -2847,15 +3620,16 @@ fn populate_dory_logits(
         });
     }
 
-    let lm_head = if weights.contains_tensor("output.weight") {
-        Some(weights.tensor("output.weight")?)
-    } else if weights.contains_tensor("token_embd.weight") {
-        // Tied LM head fallback when output.weight is omitted in GGUF.
-        Some(weights.tensor("token_embd.weight")?)
-    } else if weights.tensor_count() == 0 {
-        None
-    } else {
-        return Err(weights.tensor("output.weight").unwrap_err());
+    let lm_head = match cache.map(DoryPhysicalCache::has_output_weight) {
+        Some(true) => Some(weights.tensor("output.weight")?),
+        Some(false) => Some(weights.tensor("token_embd.weight")?),
+        None if weights.contains_tensor("output.weight") => Some(weights.tensor("output.weight")?),
+        None if weights.contains_tensor("token_embd.weight") => {
+            // Tied LM head fallback when output.weight is omitted in GGUF.
+            Some(weights.tensor("token_embd.weight")?)
+        }
+        None if weights.tensor_count() == 0 => None,
+        None => return Err(weights.tensor("output.weight").unwrap_err()),
     };
 
     let Some(lm_w) = lm_head else {
@@ -2867,12 +3641,16 @@ fn populate_dory_logits(
 
     let (vocab_rows, _) = quant::resolve_2d_dims(&lm_w, hidden.len())?;
     let proj_len = logits.len().min(vocab_rows);
-    quant::project_matvec_prefix(&mut logits[..proj_len], &lm_w, hidden)?;
+    let matrix = quant::RawWeightMatrix::from_tensor_view(&lm_w, vocab_rows, hidden.len())?;
+    let act =
+        quant::prepare_m1_activation(hidden, quant::uses_q8_0_activation(lm_w.quant()), act_q8_0)?;
+    quant::project_raw_rows_partitioned(&mut logits[..proj_len], matrix, &act, workers)?;
     if proj_len < logits.len() {
         logits[proj_len..].fill(0.0);
     }
 
     let init_std = recipe.init_std.max(1e-6);
+    let output_scale = cache.and_then(DoryPhysicalCache::output_scale);
     if let Some(scale) = output_scale {
         let scale_slice = scale.as_slice();
         if scale_slice.len() != vocab_rows {
@@ -2896,6 +3674,10 @@ fn populate_dory_logits(
             *slot *= (s / init_std) * extra;
         }
     } else {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "hidden dimension fits cleanly in f32"
+        )]
         let scale = recipe
             .logit_scale
             .unwrap_or_else(|| 1.0_f32 / (hidden.len() as f32).sqrt());

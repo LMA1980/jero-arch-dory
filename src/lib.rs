@@ -2195,4 +2195,134 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_wave4_decode_scratch_o1_invariance_fail_closed_and_rope_alignment() {
+        use jero_core::ScratchWorkspace;
+        use std::sync::Arc;
+
+        for mode in [DoryKvCacheMode::PerLoop, DoryKvCacheMode::LastLoop] {
+            let mut recipe_l1 = compact_test_recipe("S*-g", 1, 2, 1, 1).with_kv_cache_mode(mode);
+            recipe_l1.hidden_dim = 8;
+            recipe_l1.ffn_dim = 8;
+            recipe_l1.num_heads = 2;
+            recipe_l1.num_kv_heads = 1;
+            recipe_l1.head_dim = 4;
+
+            let mut recipe_l4 = compact_test_recipe("S*-g", 1, 2, 1, 4).with_kv_cache_mode(mode);
+            recipe_l4.hidden_dim = 8;
+            recipe_l4.ffn_dim = 8;
+            recipe_l4.num_heads = 2;
+            recipe_l4.num_kv_heads = 1;
+            recipe_l4.head_dim = 4;
+
+            let req1 = recipe_l1.decode_scratch_bytes(8).unwrap();
+            let req4 = recipe_l4.decode_scratch_bytes(8).unwrap();
+            assert_eq!(
+                req1, req4,
+                "O(1) decode scratch must be invariant in n_loops"
+            );
+            assert!(req4 > 0);
+
+            let weights = OwnedTestWeights::for_recipe(&recipe_l4, 4, false);
+            let cache = Arc::new(recipe_l4.build_physical_cache(&weights).unwrap());
+            assert_eq!(cache.rope_inv_freq_swa().as_ptr() as usize % 128, 0);
+            assert_eq!(cache.rope_inv_freq_full().as_ptr() as usize % 128, 0);
+            assert_eq!(cache.rope_inv_freq_swa().len(), 2);
+            assert_eq!(cache.rope_inv_freq_full().len(), 2);
+            assert!(
+                cache.rope_inv_freq_swa()[1] > cache.rope_inv_freq_full()[1],
+                "SWA theta=10K must decay slower than Full theta=10M"
+            );
+
+            let cached = recipe_l4.with_physical_cache(cache);
+            let kv_len = cached.attention_kv_layer_count().unwrap() * 2 * 8 * 4;
+            let mut kv = vec![0.0_f32; kv_len];
+            let mut logits = vec![0.0_f32; 4];
+            let mut ws = ScratchWorkspace::new(req4).unwrap();
+            let mut ctx = ExecutionContext::new(&[], 8, &mut logits, &mut kv)
+                .unwrap()
+                .with_scratch(&mut ws);
+
+            ctx.prepare_decode(0).unwrap();
+            cached.decode_step(&mut ctx, &weights).unwrap();
+            assert_eq!(ctx.scratch().unwrap().used_bytes(), 0);
+            let peak_after_step0 = ctx.scratch().unwrap().peak_used_bytes();
+            assert!(peak_after_step0 > 0 && peak_after_step0 <= req4);
+
+            ctx.prepare_decode(2).unwrap();
+            cached.decode_step(&mut ctx, &weights).unwrap();
+            assert_eq!(ctx.scratch().unwrap().used_bytes(), 0);
+            assert!(ctx.scratch().unwrap().peak_used_bytes() <= req4);
+
+            let mut small_ws = ScratchWorkspace::new(req4.saturating_sub(1)).unwrap();
+            let mut small_kv = vec![0.0_f32; kv_len];
+            let mut small_logits = vec![0.0_f32; 4];
+            let mut fail_ctx = ExecutionContext::new(&[], 8, &mut small_logits, &mut small_kv)
+                .unwrap()
+                .with_scratch(&mut small_ws);
+            fail_ctx.prepare_decode(1).unwrap();
+            let err = cached.decode_step(&mut fail_ctx, &weights).unwrap_err();
+            assert!(
+                matches!(err, K3Error::TensorBoundsError { ref tensor_name, .. } if tensor_name == "dory_decode_scratch"),
+                "expected fail-closed dory_decode_scratch bounds error, got {err:?}"
+            );
+            assert_eq!(fail_ctx.position(), 0);
+        }
+    }
+
+    #[test]
+    fn test_wave4_worker_partition_setting_and_decode_parity() {
+        use jero_core::ScratchWorkspace;
+        use std::sync::Arc;
+
+        let mut base = compact_test_recipe("S*-g", 1, 2, 1, 2);
+        base.hidden_dim = 16;
+        base.ffn_dim = 64;
+        base.num_heads = 4;
+        base.num_kv_heads = 2;
+        base.head_dim = 4;
+        base.vocab_size = 64;
+        assert_eq!(base.worker_partitions(), None);
+
+        let weights = OwnedTestWeights::for_recipe(&base, 64, true);
+        let cache = Arc::new(base.build_physical_cache(&weights).unwrap());
+        let req = base.decode_scratch_bytes(8).unwrap();
+        let kv_len = base.attention_kv_layer_count().unwrap() * 2 * 8 * 8;
+
+        let mut ref_logits = Vec::new();
+        for workers in [Some(1), Some(4), Some(8)] {
+            let recipe = base
+                .clone()
+                .with_worker_partitions(workers)
+                .with_physical_cache(Arc::clone(&cache));
+            assert_eq!(recipe.worker_partitions(), workers);
+            let mut ws = ScratchWorkspace::new(req).unwrap();
+            let mut kv = vec![0.0_f32; kv_len];
+            let mut logits = vec![0.0_f32; 64];
+            let mut ctx = ExecutionContext::new(&[], 8, &mut logits, &mut kv)
+                .unwrap()
+                .with_scratch(&mut ws);
+            ctx.prepare_decode(3).unwrap();
+            recipe.decode_step(&mut ctx, &weights).unwrap();
+            assert_eq!(ctx.scratch().unwrap().used_bytes(), 0);
+            if ref_logits.is_empty() {
+                ref_logits = logits;
+            } else {
+                let diff = max_abs_diff(&ref_logits, &logits);
+                #[cfg(not(miri))]
+                assert_eq!(
+                    diff, 0.0,
+                    "worker partition {workers:?} must match single-worker logits bit-exact"
+                );
+                // Miri injects non-deterministic ULP jitter into transcendental libm calls
+                // (exp/sin/cos) across decode runs; native targets enforce strict 0.0.
+                #[cfg(miri)]
+                assert!(
+                    diff <= 1e-6,
+                    "worker partition {workers:?} drifted {diff} beyond Miri libm ULP jitter"
+                );
+            }
+        }
+    }
 }
