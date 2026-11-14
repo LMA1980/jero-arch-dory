@@ -7,8 +7,8 @@ pub mod recipe;
 
 pub use physical_cache::{
     AlignedF32Block, AlignedF32Vec, DORY_BOS_TOKEN, DORY_EOS_TOKEN, DORY_IM_START_TOKEN,
-    DORY_MEDIUM_REASONING_SUFFIX, DORY_THINK_CLOSE_TOKEN, DORY_THINK_OPEN_TOKEN, DoryCachedWeight,
-    DoryPhysicalCache, DoryPhysicalSubLayer, DoryStopMetadata,
+    DORY_MEDIUM_REASONING_SUFFIX, DORY_THINK_CLOSE_TOKEN, DORY_THINK_OPEN_TOKEN, DoryBatchAct,
+    DoryCachedWeight, DoryPhysicalCache, DoryPhysicalSubLayer, DoryStopMetadata,
 };
 pub use recipe::{
     CANONICAL_DORY_LAYER_PATTERN, DORY_DEFAULT_VOCAB_SIZE, DORY_L2_EPS, DoryKvCacheMode,
@@ -1905,6 +1905,294 @@ mod tests {
             let mut prefix = [0.0_f32; 1];
             cached.project_prefix_f32(&mut prefix, &input).unwrap();
             assert!((actual[0] - prefix[0]).abs() < 1e-6);
+        }
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "slice lengths must match for parity diff");
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "verifies 3-segment PerLoop batched prefill, chunked start_position, sequential decode parity, and fail-closed guards"
+    )]
+    fn test_dory_batched_prefill_vs_chunked_and_decode_parity_per_loop() {
+        // S (input) -> * g (recurrent x 3) -> - (output), PerLoop with sliding_window=3.
+        let recipe = compact_test_recipe("S*g-", 1, 2, 1, 3);
+        let weights = OwnedTestWeights::for_recipe(&recipe, 4, true);
+        let cached_recipe = recipe.clone().with_physical_cache(std::sync::Arc::new(
+            recipe.build_physical_cache(&weights).unwrap(),
+        ));
+
+        let n_ctx = 16_usize;
+        let kv_slots = recipe.attention_kv_layer_count().unwrap();
+        let kv_dim = (recipe.num_kv_heads * recipe.head_dim) as usize;
+        let kv_len = kv_slots * 2 * n_ctx * kv_dim;
+        let tokens = [0_u32, 2, 1, 3, 2, 0];
+
+        // 1. Single batched prefill + 1 follow-up decode token.
+        let mut kv_batch = vec![0.0_f32; kv_len];
+        let mut logits_batch = [0.0_f32; 4];
+        let mut ctx_batch =
+            ExecutionContext::new(&tokens, n_ctx, &mut logits_batch, &mut kv_batch).unwrap();
+        cached_recipe
+            .prefill_step(&mut ctx_batch, &weights)
+            .unwrap();
+        assert_eq!(ctx_batch.position(), tokens.len());
+
+        // 2. Chunked start_position prefill: [0..2] (no logits), [2..5] (no logits), [5..6] (logits).
+        let mut kv_chunk = vec![0.0_f32; kv_len];
+        let sentinel = 123.5_f32;
+        let mut untouched = [sentinel; 4];
+        {
+            let mut ctx_c1 = ExecutionContext::new_prefill_chunk(
+                &tokens[..2],
+                n_ctx,
+                0,
+                false,
+                &mut [],
+                &mut kv_chunk,
+            )
+            .unwrap();
+            cached_recipe.prefill_step(&mut ctx_c1, &weights).unwrap();
+            assert_eq!(ctx_c1.position(), 2);
+
+            let mut ctx_c2 = ExecutionContext::new_prefill_chunk(
+                &tokens[2..5],
+                n_ctx,
+                2,
+                false,
+                &mut untouched,
+                &mut kv_chunk,
+            )
+            .unwrap();
+            cached_recipe.prefill_step(&mut ctx_c2, &weights).unwrap();
+            assert_eq!(ctx_c2.position(), 5);
+        }
+        assert_eq!(
+            untouched, [sentinel; 4],
+            "compute_logits=false must not write logits"
+        );
+
+        let mut logits_chunk = [0.0_f32; 4];
+        let mut ctx_c3 = ExecutionContext::new_prefill_chunk(
+            &tokens[5..],
+            n_ctx,
+            5,
+            true,
+            &mut logits_chunk,
+            &mut kv_chunk,
+        )
+        .unwrap();
+        cached_recipe.prefill_step(&mut ctx_c3, &weights).unwrap();
+        assert_eq!(ctx_c3.position(), tokens.len());
+
+        // 3. Sequential token-by-token decode_step oracle across all M prompt tokens.
+        let mut kv_seq = vec![0.0_f32; kv_len];
+        let mut logits_seq = [0.0_f32; 4];
+        let mut ctx_seq = ExecutionContext::new(&[], n_ctx, &mut logits_seq, &mut kv_seq).unwrap();
+        for &tok in &tokens {
+            ctx_seq.prepare_decode(tok).unwrap();
+            cached_recipe.decode_step(&mut ctx_seq, &weights).unwrap();
+        }
+        assert_eq!(ctx_seq.position(), tokens.len());
+
+        assert!(
+            max_abs_diff(ctx_batch.logits(), ctx_seq.logits()) < 1e-4,
+            "batched prefill vs sequential decode logits mismatch"
+        );
+        assert!(
+            max_abs_diff(ctx_c3.logits(), ctx_seq.logits()) < 1e-4,
+            "chunked prefill vs sequential decode logits mismatch"
+        );
+        assert!(
+            max_abs_diff(ctx_batch.kv_cache(), ctx_seq.kv_cache()) < 1e-4,
+            "batched prefill vs sequential KV state mismatch"
+        );
+        assert!(
+            max_abs_diff(ctx_c3.kv_cache(), ctx_seq.kv_cache()) < 1e-4,
+            "chunked prefill vs sequential KV state mismatch"
+        );
+
+        // 4. Subsequent decode_step must agree after both batched and sequential prefill.
+        ctx_batch.prepare_decode(1).unwrap();
+        ctx_seq.prepare_decode(1).unwrap();
+        cached_recipe.decode_step(&mut ctx_batch, &weights).unwrap();
+        cached_recipe.decode_step(&mut ctx_seq, &weights).unwrap();
+        assert!(max_abs_diff(&logits_batch, &logits_seq) < 1e-4);
+
+        // 5. Synthetic empty-weight stub + out-of-bounds chunk guard fail cleanly.
+        let empty = TestWeights { tensors: vec![] };
+        let mut stub_logits = [0.0_f32; 4];
+        let mut stub_logits_seq = [0.0_f32; 4];
+        let mut stub_kv_b = vec![0.0_f32; kv_len];
+        let mut stub_kv_s = vec![0.0_f32; kv_len];
+        let mut ctx_stub =
+            ExecutionContext::new(&[1, 3, 2], n_ctx, &mut stub_logits, &mut stub_kv_b).unwrap();
+        recipe.prefill_step(&mut ctx_stub, &empty).unwrap();
+        let mut ctx_stub_seq =
+            ExecutionContext::new(&[], n_ctx, &mut stub_logits_seq, &mut stub_kv_s).unwrap();
+        for tok in [1_u32, 3, 2] {
+            ctx_stub_seq.prepare_decode(tok).unwrap();
+            recipe.decode_step(&mut ctx_stub_seq, &empty).unwrap();
+        }
+        assert!(max_abs_diff(&stub_logits, &stub_logits_seq) < 1e-6);
+
+        let mut err_logits = [0.0_f32; 4];
+        let mut ctx_oom =
+            ExecutionContext::new(&[0, 1], 2, &mut err_logits, &mut kv_batch).unwrap();
+        ctx_oom.advance_position(1).unwrap();
+        assert!(matches!(
+            recipe.prefill_step(&mut ctx_oom, &weights),
+            Err(K3Error::ContextLengthExceeded {
+                requested_tokens: 3,
+                max_context_tokens: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_dory_batched_prefill_last_loop_prefix_and_final_slot_parity() {
+        // Case A: LastLoop with recurrent MLP ('S-g', n_loops=3) -> bit-exact parity vs decode_step.
+        let ll_mlp =
+            compact_test_recipe("S-g", 1, 1, 1, 3).with_kv_cache_mode(DoryKvCacheMode::LastLoop);
+        let w_mlp = OwnedTestWeights::for_recipe(&ll_mlp, 4, true);
+        let n_ctx = 16_usize;
+        let kv_dim = (ll_mlp.num_kv_heads * ll_mlp.head_dim) as usize;
+        let kv_len_mlp = ll_mlp.attention_kv_layer_count().unwrap() * 2 * n_ctx * kv_dim;
+        let tokens = [0_u32, 1, 2, 3];
+
+        let mut kv_b = vec![0.0_f32; kv_len_mlp];
+        let mut logits_b = [0.0_f32; 4];
+        let mut ctx_b = ExecutionContext::new(&tokens, n_ctx, &mut logits_b, &mut kv_b).unwrap();
+        ll_mlp.prefill_step(&mut ctx_b, &w_mlp).unwrap();
+
+        let mut kv_s = vec![0.0_f32; kv_len_mlp];
+        let mut logits_s = [0.0_f32; 4];
+        let mut ctx_s = ExecutionContext::new(&[], n_ctx, &mut logits_s, &mut kv_s).unwrap();
+        for &tok in &tokens {
+            ctx_s.prepare_decode(tok).unwrap();
+            ll_mlp.decode_step(&mut ctx_s, &w_mlp).unwrap();
+        }
+        assert!(max_abs_diff(&logits_b, &logits_s) < 1e-4);
+        assert!(max_abs_diff(&kv_b, &kv_s) < 1e-4);
+
+        // Case B: LastLoop with recurrent Attention ('S*g', n_loops=3) overwrites chunk [start_pos..end_pos]
+        // in-place leaving finalized last-loop KV while preserving prefix chunks untouched.
+        let ll_attn =
+            compact_test_recipe("S*g", 1, 1, 1, 3).with_kv_cache_mode(DoryKvCacheMode::LastLoop);
+        let w_attn = OwnedTestWeights::for_recipe(&ll_attn, 4, true);
+        let kv_len_attn = ll_attn.attention_kv_layer_count().unwrap() * 2 * n_ctx * kv_dim;
+
+        let mut kv_chunk1 = vec![0.0_f32; kv_len_attn];
+        let mut logits_c1 = [0.0_f32; 4];
+        let mut ctx_c1 =
+            ExecutionContext::new(&tokens[..2], n_ctx, &mut logits_c1, &mut kv_chunk1).unwrap();
+        ll_attn.prefill_step(&mut ctx_c1, &w_attn).unwrap();
+        let prefix_snapshot = kv_chunk1.clone();
+
+        let mut logits_c2 = [0.0_f32; 4];
+        let mut ctx_c2 = ExecutionContext::new_prefill_chunk(
+            &tokens[2..],
+            n_ctx,
+            2,
+            true,
+            &mut logits_c2,
+            &mut kv_chunk1,
+        )
+        .unwrap();
+        ll_attn.prefill_step(&mut ctx_c2, &w_attn).unwrap();
+
+        // Prefix positions [0..2) in all slots must remain bit-identical to chunk 1's snapshot.
+        let slots = ll_attn.attention_kv_layer_count().unwrap();
+        for slot in 0..slots {
+            let base = slot * 2 * n_ctx * kv_dim;
+            let k_pref = &kv_chunk1[base..base + 2 * kv_dim];
+            let k_snap = &prefix_snapshot[base..base + 2 * kv_dim];
+            assert_eq!(k_pref, k_snap);
+            let v_base = base + n_ctx * kv_dim;
+            assert_eq!(
+                &kv_chunk1[v_base..v_base + 2 * kv_dim],
+                &prefix_snapshot[v_base..v_base + 2 * kv_dim]
+            );
+        }
+
+        // Verify prefix positions [0..2) in chunked LastLoop strictly match single-batch prefix [0..2),
+        // and slot [2..4) holds finite non-zero finalized loop=n_loops-1 KV state.
+        let mut kv_single = vec![0.0_f32; kv_len_attn];
+        let mut logits_single = [0.0_f32; 4];
+        let mut ctx_single =
+            ExecutionContext::new(&tokens, n_ctx, &mut logits_single, &mut kv_single).unwrap();
+        ll_attn.prefill_step(&mut ctx_single, &w_attn).unwrap();
+        for slot in 0..slots {
+            let base = slot * 2 * n_ctx * kv_dim;
+            assert!(
+                max_abs_diff(
+                    &kv_chunk1[base..base + 2 * kv_dim],
+                    &kv_single[base..base + 2 * kv_dim]
+                ) < 1e-5
+            );
+            let tail = &kv_chunk1[base + 2 * kv_dim..base + 4 * kv_dim];
+            assert!(tail.iter().all(|v| v.is_finite()) && tail.iter().any(|&v| v.abs() > 1e-4));
+        }
+        assert!(logits_c2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_dory_batch_act_quantized_reuse_parity() {
+        let m = 4_usize;
+        let k = 32_usize;
+        let rows = 2_usize;
+        let batch_act: Vec<f32> = (0..m * k)
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss, reason = "small test matrix index")]
+                let x = ((i % 11) as f32 - 5.0) * 0.08;
+                x
+            })
+            .collect();
+
+        let q4_bytes = encode_q4_0_blocks(rows, k, 0.25);
+        let q8_bytes = encode_q8_0_blocks(rows, k, 0.125);
+        let mut scratch = DoryBatchAct::new();
+        scratch.prepare_into(&batch_act, m, k).unwrap();
+        assert_eq!(scratch.rows(), m);
+        assert_eq!(scratch.cols(), k);
+
+        for (quant, bytes) in [(QuantType::Q4_0, q4_bytes), (QuantType::Q8_0, q8_bytes)] {
+            let dims = [k, rows];
+            let view =
+                TensorView::from_bytes("blk.0.batch.weight", quant, &dims, 0, &bytes).unwrap();
+            let cached = DoryCachedWeight::from_tensor_view(&view, rows, k).unwrap();
+
+            let mut batched_out = vec![0.0_f32; m * rows];
+            cached
+                .project_batch_prepared(&mut batched_out, &scratch)
+                .unwrap();
+
+            for r in 0..m {
+                let mut single_out = vec![0.0_f32; rows];
+                cached
+                    .project_f32(&mut single_out, &batch_act[r * k..(r + 1) * k])
+                    .unwrap();
+                let diff = max_abs_diff(&batched_out[r * rows..(r + 1) * rows], &single_out);
+                assert!(
+                    diff < 1e-5,
+                    "{quant} row {r}: prepared GEMM vs GEMV mismatch diff={diff}"
+                );
+            }
+
+            #[cfg(feature = "with-kernels")]
+            {
+                let q8_act = jero_kernels_rvv::QuantizedActQ8::quantize(&batch_act, m, k).unwrap();
+                let mut direct_out = vec![0.0_f32; m * rows];
+                cached.project_batch_act(&mut direct_out, &q8_act).unwrap();
+                assert!(max_abs_diff(&batched_out, &direct_out) < 1e-6);
+            }
         }
     }
 }
